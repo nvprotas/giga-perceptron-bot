@@ -238,22 +238,23 @@ def score_progress_bar(score, maxv=25):
     return "🏁 " + "█"*filled + "-"*(20-filled) + f" {score:.1f}/{maxv}"
 
 def make_7days_history(user_info):
+    """
+    Генерирует историю на 7 дней:
+    в каждом дне хранится только скор за этот день.
+    """
     d0 = datetime.now() - timedelta(days=6)
     out = []
-    window_scores = []
     for i in range(7):
         p = random_day_params(user_info)
-        p['дата'] = (d0+timedelta(days=i)).strftime("%d.%m")
-        score = round(params_to_score(p),2)
-        # Add current day's score to window
-        window_scores.append(score)
-        # Calculate window score as sum of last 7 days, here precisely the current ones in out
-        window_score = round(sum(window_scores), 2)
-        p['скор'] = window_score
+        p['дата'] = (d0 + timedelta(days=i)).strftime("%d.%m")
+        # ежедневный скор
+        daily_score = round(params_to_score(p), 2)
+        p['скор'] = daily_score
         out.append(p)
     logger.info(f"7 days history generated for params: {user_info}")
     logger.debug(f"History: {out}")
     return out
+
 
 def next_day(user_state: UserHealthState):
     ui = user_state.input_answers
@@ -509,10 +510,12 @@ def start_simulation_callback(call):
     bot.edit_message_text("🔄 Генерирую вашу историю за 7 дней...",
                          chat_id=call.message.chat.id,
                          message_id=call.message.message_id)
+
+    # Генерация истории 7 дней
     form_info = user.input_answers.copy()
     hist = make_7days_history(form_info)
     user.history_data = hist
-    user.total_score = round(sum(d['скор'] for d in hist[-7:]), 2)
+    user.total_score = float(sum(d['скор'] for d in hist))
     user.current_day = 7
     user.interaction_state = "showing_history"
     logger.info(f"History generated and state updated for user_id={user.user_id}")
@@ -531,14 +534,16 @@ def generate_params_callback(call):
     bot.edit_message_text("🔄 Генерирую вашу историю за 7 дней...",
                          chat_id=call.message.chat.id,
                          message_id=call.message.message_id)
+
+    # Генерация истории 7 дней с ограничением по суммарному скору
     form_info = user.input_answers.copy()
     hist = make_7days_history(form_info)
-    total_score = round(sum(d['скор'] for d in hist[-7:]), 2)
+    total_score = float(sum(d['скор'] for d in hist))
     attempts = 0
     max_attempts = 10
     while total_score > 25 and attempts < max_attempts:
         hist = make_7days_history(form_info)
-        total_score = round(sum(d['скор'] for d in hist[-7:]), 2)
+        total_score = float(sum(d['скор'] for d in hist))
         attempts += 1
     if total_score > 25:
         total_score = 24.0
@@ -554,12 +559,13 @@ def generate_params_callback(call):
                          message_id=call.message.message_id,
                          reply_markup=main_menu_markup())
     user.add_message(report, from_user=False)
+
+    # Show generated default parameters to user
     default_params_str = "\n".join(f"{k}: {v}" for k, v in user.input_answers.items())
     bot.send_message(
         chat_id=call.message.chat.id,
         text=f"Сгенерированы параметры пользователя:\n{default_params_str}",
     )
-
 
 @bot.callback_query_handler(func=lambda call: call.data == "input_params")
 def input_params_callback(call):
@@ -592,43 +598,48 @@ def start_chat_callback(call):
 @bot.callback_query_handler(func=lambda call: call.data == "next_sim_day")
 def next_sim_day_callback(call):
     user = get_user(call.from_user.id)
-    logger.info(f"User_id={user.user_id} pressed next_sim_day (simulating next day)")
     # Шаг 1: генерируем новый день
     day_dict = next_day(user)
-    day_dict['скор'] = round(params_to_score(day_dict), 2)
-    day_dict['дата'] = (datetime.now() + timedelta(days=user.current_day)).strftime("%d.%m")
-
-    # Обновляем историю, не больше 7 дней
     user.history_data.append(day_dict)
-    if len(user.history_data) > 7:
-        user.history_data.pop(0)
-
-    # Пересчет скора только за последние 7 дней
-    user.total_score = round(sum(d['скор'] for d in user.history_data), 2)
     user.current_day += 1
 
-    # Шаг 2: просим LLM сделать короткий отчёт
+    # Шаг 2: пересчитываем общий скор как сумму скорoв последних 7 дней
+    last_seven = user.history_data[-7:]
+    user.total_score = sum(d['скор'] for d in last_seven)
+
+    # Шаг 3: отчёт по дню
     day_text = day_report_message(user, day_dict)
     bar = score_progress_bar(user.total_score)
-    report = f"{day_dict['дата']} — {humanify_params(day_dict)}\n*Сегодня: {day_dict['скор']:.2f} баллов*\n\n{day_text}\n\n{bar}"
+    report = (
+        f"{day_dict['дата']} — {humanify_params(day_dict)}\n"
+        f"*Сегодня: {day_dict['скор']:.2f} баллов*\n\n"
+        f"{day_text}\n\n{bar}"
+    )
+
+    # Показываем кнопки и обновляем состояние
     markup = main_menu_markup()
     user.interaction_state = "daily_update"
-    logger.info(f"Daily update processed: user_id={user.user_id}, current_day={user.current_day}, total_score={user.total_score:.2f}")
     try:
         bot.edit_message_text(
-            report, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup, parse_mode='Markdown'
+            report,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode='Markdown'
         )
     except Exception as e:
-        logger.error(f"Error editing message for user_id={user.user_id} in next_sim_day_callback: {e}")
+        logger.error(f"Error editing message: {e}")
         bot.send_message(call.message.chat.id, report, reply_markup=markup, parse_mode='Markdown')
 
+    # Конгратуляции, если порог превышен
     if user.total_score > 25:
         bot.send_message(call.message.chat.id, "🎉 Поздравляем! Ваш общий счет превысил пороговое значение 25!")
 
-    if user.current_day >= 14:
-        logger.info(f"User_id={user.user_id} finished 14 days simulation, resetting dialog")
-        bot.send_message(call.message.chat.id, "🎉 Вы прошли 14 дней! Чтобы начать заново, отправьте /start")
+    # Завершение симуляции через 14 дней
+    if user.current_day >= 21:
+        bot.send_message(call.message.chat.id, "🎉 Вы прошли 21 день! Чтобы начать заново, отправьте /start")
         user.reset_dialog()
+
 
 # ================================
 #   Запуск
