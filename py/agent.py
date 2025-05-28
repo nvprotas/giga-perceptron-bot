@@ -1,1023 +1,631 @@
 import logging
 import json
-import asyncio
+import random
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any
 import os
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
 
 import telebot
 from telebot import types
-from telebot.async_telebot import AsyncTeleBot
-import threading
-import time
-
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.graph import MessagesState
-from langgraph.graph import START, StateGraph, END
-from langgraph.prebuilt import ToolNode
 
-
-import os
 from dotenv import load_dotenv
-
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GIGACHAT_API_KEY = os.getenv("GIGA_CHAT_API_KEY")
+MODEL_PROVIDER = os.getenv("MODEL_PROVIDER")
+MODEL = os.getenv("MODEL")
 
-# Настройка логгера
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('health_bot.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Создаем бота
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# Словарь для хранения состояний пользователей
-user_states = {}
+# Основные константы для скоров
+PARAMS = [
+    "сон", "активность", "питание", "лекарства", "чтение", "ментальное", "медитация", "спорт", "нагрузка по работе"
+]
+CATS = ["отлично", "хорошо", "удовлетворительно", "плохо"]
+YN = ["да", "нет"]
 
+# ================================
+#   Состояние пользователя
+# ================================
 
 @dataclass
 class UserHealthState:
-    """Класс для хранения состояния здоровья пользователя"""
     user_id: int
-    
-    # Физические показатели
-    water_intake: float = 0.0
-    steps_count: int = 0
-    exercise_minutes: int = 0
-    sleep_hours: float = 0.0
-    
-    # Ментальные показатели
-    stress_level: int = 5
-    mood_score: int = 5
-    meditation_minutes: int = 0
-    social_interactions: int = 0
-    
-    # Рабочие показатели
-    work_hours: float = 0.0
-    breaks_taken: int = 0
-    tasks_completed: List[str] = None
-    meetings_attended: int = 0
-    
-    # История и активности
-    daily_activities: List[Dict] = None
-    achievements: List[str] = None
-    challenges: List[str] = None
-    
-    def __post_init__(self):
-        if self.tasks_completed is None:
-            self.tasks_completed = []
-        if self.daily_activities is None:
-            self.daily_activities = []
-        if self.achievements is None:
-            self.achievements = []
-        if self.challenges is None:
-            self.challenges = []
-    
-    def add_activity(self, activity: str, category: str):
-        """Добавляет активность в дневной журнал"""
-        self.daily_activities.append({
-            "activity": activity,
-            "category": category,
-            "timestamp": datetime.now().isoformat()
-        })
-        logger.info(f"User {self.user_id}: Added activity - {activity}")
-    
-    def get_health_summary(self) -> Dict:
-        """Возвращает сводку по здоровью"""
-        return {
-            "physical": {
-                "water_intake": self.water_intake,
-                "steps_count": self.steps_count,
-                "exercise_minutes": self.exercise_minutes,
-                "sleep_hours": self.sleep_hours
-            },
-            "mental": {
-                "stress_level": self.stress_level,
-                "mood_score": self.mood_score,
-                "meditation_minutes": self.meditation_minutes,
-                "social_interactions": self.social_interactions
-            },
-            "work": {
-                "work_hours": self.work_hours,
-                "breaks_taken": self.breaks_taken,
-                "tasks_completed": len(self.tasks_completed),
-                "meetings_attended": self.meetings_attended
-            }
+    dialog_history: List[str] = field(default_factory=list)
+    interaction_state: Optional[str] = None      # FSM: None|'goal'|'collect_data'|'confirm_generation'|'showing_history'|'daily_update'|'chat'
+    health_goal: Optional[str] = None
+    input_answers: Dict[str, Any] = field(default_factory=dict)     # анкета
+    history_data: List[Dict[str, Any]] = field(default_factory=list)# 7 дней данных
+    current_day: int = 0
+    total_score: float = 0.0
+    waiting_for_params: bool = False  # ждем ввод параметров от пользователя
+
+    # Simple in-memory agent memory for context preservation
+    _memory_context: str = ""
+
+    def add_message(self, message: str, from_user: bool):
+        tag = "👤" if from_user else "🤖"
+        logger.debug(f"Add message to history | user_id={self.user_id} | from_user={from_user} | msg={message}")
+        self.dialog_history.append(f"{tag} {message}")
+        # Also update memory context with latest message
+        self.update_memory(f"{tag} {message}")
+
+    def reset_dialog(self):
+        logger.info(f"Resetting dialog and state for user_id={self.user_id}")
+        self.dialog_history = []
+        self.interaction_state = None
+        self.health_goal = None
+        self.input_answers = {}
+        self.history_data = []
+        self.current_day = 0
+        self.total_score = 0.0
+        self.waiting_for_params = False
+        self._memory_context = ""
+
+    def get_context(self):
+        # Return memory context if available, else dialog history last 8 messages
+        if self._memory_context:
+            return self._memory_context
+        else:
+            return "\n".join(self.dialog_history[-10:])
+
+    def update_memory(self, new_text: str, max_length: int = 2000):
+        """Update the memory context with new text, trimming if needed."""
+        if not self._memory_context:
+            self._memory_context = new_text
+        else:
+            self._memory_context = f"{self._memory_context}\n{new_text}"
+        # Trim context if it gets too long
+        if len(self._memory_context) > max_length:
+            # Keep only the last max_length characters intelligently (by lines)
+            lines = self._memory_context.splitlines()
+            trimmed_lines = []
+            total_len = 0
+            for line in reversed(lines):
+                total_len += len(line) + 1
+                if total_len > max_length:
+                    break
+                trimmed_lines.append(line)
+            trimmed_lines.reverse()
+            self._memory_context = "\n".join(trimmed_lines)
+
+    def generate_default_params(self):
+        """Генерирует случайные параметры пользователя при старте"""
+        genders = ["мужчина", "женщина"]
+        activity_levels = ["низкий", "средний", "высокий"]
+        stress_levels = ["низкий", "средний", "высокий"]
+
+        self.input_answers = {
+            "пол": random.choice(genders),
+            "возраст": random.randint(20, 60),
+            "рост": random.randint(155, 190),
+            "вес": random.randint(55, 100),
+            "активность": random.choice(activity_levels),
+            "уровень стресса": random.choice(stress_levels),
+            "курение": random.choice(YN),
+            "алкоголь": random.choice(YN),
+            "спорт": random.choice(YN),
+            "чтение": random.choice(YN),
+            "медитация": random.choice(YN)
         }
-    
-    def get_daily_summary_text(self) -> str:
-        """Возвращает текстовую сводку дня для пользователя"""
-        summary = self.get_health_summary()
-        
-        text = f"📊 *Ваша сводка за сегодня:*\n\n"
-        
-        # Физические показатели
-        text += f"💪 *Физическое здоровье:*\n"
-        text += f"💧 Вода: {summary['physical']['water_intake']}л\n"
-        text += f"👣 Шаги: {summary['physical']['steps_count']}\n"
-        text += f"🏃 Упражнения: {summary['physical']['exercise_minutes']} мин\n"
-        text += f"😴 Сон: {summary['physical']['sleep_hours']} ч\n\n"
-        
-        # Ментальные показатели
-        text += f"🧠 *Ментальное состояние:*\n"
-        text += f"😊 Настроение: {summary['mental']['mood_score']}/10\n"
-        text += f"😰 Стресс: {summary['mental']['stress_level']}/10\n"
-        text += f"🧘 Медитация: {summary['mental']['meditation_minutes']} мин\n"
-        text += f"👥 Соц. контакты: {summary['mental']['social_interactions']}\n\n"
-        
-        # Рабочие показатели
-        text += f"💼 *Работа:*\n"
-        text += f"⏰ Рабочих часов: {summary['work']['work_hours']}\n"
-        text += f"☕ Перерывов: {summary['work']['breaks_taken']}\n"
-        text += f"✅ Задач выполнено: {summary['work']['tasks_completed']}\n"
-        text += f"🤝 Встреч: {summary['work']['meetings_attended']}\n"
-        
-        return text
+        logger.info(f"Default parameters generated for user_id={self.user_id}: {self.input_answers}")
 
+# users state storage:
+user_states: Dict[int, UserHealthState] = {}
 
-def get_user_state(user_id: int) -> UserHealthState:
-    """Получает или создает состояние пользователя"""
+def get_user(user_id: int) -> UserHealthState:
     if user_id not in user_states:
-        user_states[user_id] = UserHealthState(user_id=user_id)
-        logger.info(f"Created new user state for user {user_id}")
+        logger.info(f"New user session started: user_id={user_id}")
+        user_states[user_id] = UserHealthState(user_id)
     return user_states[user_id]
 
+# ================================
+#   LLM и Prompt'ы
+# ================================
 
-# Инструменты для работы с конкретным пользователем
-def create_user_tools(user_id: int):
-    """Создает инструменты для конкретного пользователя"""
-    user_state = get_user_state(user_id)
-    
-    @tool
-    def log_water_intake(amount: float) -> str:
-        """Записывает потребление воды в литрах"""
-        user_state.water_intake += amount
-        user_state.add_activity(f"Выпил {amount}л воды", "physical")
-        return f"Записано потребление воды: {amount}л. Всего за день: {user_state.water_intake}л"
+if MODEL_PROVIDER == "openai":
+    llm = ChatOpenAI(
+        model=MODEL,
+        temperature=0.6,
+        api_key=OPENAI_API_KEY,
+        max_completion_tokens=2048,
+        streaming=False
+    )
+    print(llm.invoke("test"))
+elif MODEL_PROVIDER == "gigachat":
+    from langchain_gigachat.chat_models import GigaChat
+    print(GIGACHAT_API_KEY)
+    llm = GigaChat(
+        model=MODEL,
+        credentials=GIGACHAT_API_KEY,
+        temperature=0.6,
+        max_completion_tokens=2048,
+        streaming=False,
+        verify_ssl_certs=False,
+        # scope="GIGACHAT_API_CORP"
+        scope="GIGACHAT_API_PERS"
+    )
+    print(llm.invoke("test"))
+else:
+    raise ValueError(f"Unsupported model provider: {MODEL_PROVIDER}. Supported: 'openai', 'gigachat'.")
 
-    @tool
-    def log_exercise(minutes: int, exercise_type: str) -> str:
-        """Записывает физическую активность"""
-        user_state.exercise_minutes += minutes
-        user_state.add_activity(f"{exercise_type} - {minutes} минут", "physical")
-        return f"Записана активность: {exercise_type} ({minutes} мин). Всего упражнений: {user_state.exercise_minutes} мин"
-
-    @tool
-    def log_steps(steps: int) -> str:
-        """Записывает количество шагов"""
-        user_state.steps_count += steps
-        user_state.add_activity(f"Прошел {steps} шагов", "physical")
-        return f"Записано шагов: {steps}. Всего за день: {user_state.steps_count}"
-
-    @tool
-    def log_sleep(hours: float) -> str:
-        """Записывает продолжительность сна"""
-        user_state.sleep_hours = hours
-        user_state.add_activity(f"Спал {hours} часов", "physical")
-        return f"Записан сон: {hours} часов"
-
-    @tool
-    def update_mood(score: int) -> str:
-        """Обновляет оценку настроения (1-10)"""
-        user_state.mood_score = max(1, min(10, score))
-        user_state.add_activity(f"Настроение: {score}/10", "mental")
-        return f"Настроение обновлено: {score}/10"
-
-    @tool
-    def update_stress(level: int) -> str:
-        """Обновляет уровень стресса (1-10)"""
-        user_state.stress_level = max(1, min(10, level))
-        user_state.add_activity(f"Уровень стресса: {level}/10", "mental")
-        return f"Уровень стресса обновлен: {level}/10"
-
-    @tool
-    def log_meditation(minutes: int) -> str:
-        """Записывает время медитации"""
-        user_state.meditation_minutes += minutes
-        user_state.add_activity(f"Медитация {minutes} минут", "mental")
-        return f"Записана медитация: {minutes} мин. Всего: {user_state.meditation_minutes} мин"
-
-    @tool
-    def log_social_interaction(description: str) -> str:
-        """Записывает социальное взаимодействие"""
-        user_state.social_interactions += 1
-        user_state.add_activity(f"Социальное взаимодействие: {description}", "mental")
-        return f"Записано социальное взаимодействие: {description}"
-
-    @tool
-    def log_work_hours(hours: float) -> str:
-        """Записывает рабочие часы"""
-        user_state.work_hours += hours
-        user_state.add_activity(f"Работал {hours} часов", "work")
-        return f"Записано рабочих часов: {hours}. Всего: {user_state.work_hours}"
-
-    @tool
-    def log_break(duration: int) -> str:
-        """Записывает перерыв"""
-        user_state.breaks_taken += 1
-        user_state.add_activity(f"Перерыв {duration} минут", "work")
-        return f"Записан перерыв: {duration} мин. Всего перерывов: {user_state.breaks_taken}"
-
-    @tool
-    def complete_task(task_name: str) -> str:
-        """Отмечает задачу как выполненную"""
-        user_state.tasks_completed.append(task_name)
-        user_state.add_activity(f"Выполнена задача: {task_name}", "work")
-        return f"Задача выполнена: {task_name}. Всего задач: {len(user_state.tasks_completed)}"
-
-    @tool
-    def log_meeting(meeting_name: str, duration: int) -> str:
-        """Записывает участие во встрече"""
-        user_state.meetings_attended += 1
-        user_state.add_activity(f"Встреча: {meeting_name} ({duration} мин)", "work")
-        return f"Записана встреча: {meeting_name} ({duration} мин)"
-
-    @tool
-    def add_achievement(achievement: str) -> str:
-        """Добавляет достижение дня"""
-        user_state.achievements.append(achievement)
-        user_state.add_activity(f"Достижение: {achievement}", "summary")
-        return f"Добавлено достижение: {achievement}"
-
-    @tool
-    def add_challenge(challenge: str) -> str:
-        """Добавляет вызов/сложность дня"""
-        user_state.challenges.append(challenge)
-        user_state.add_activity(f"Вызов: {challenge}", "summary")
-        return f"Добавлен вызов: {challenge}"
-
-    return {
-        'health_tools': [log_water_intake, log_exercise, log_steps, log_sleep],
-        'mental_health_tools': [update_mood, update_stress, log_meditation, log_social_interaction],
-        'schedule_tools': [log_work_hours, log_break, complete_task, log_meeting],
-        'summary_tools': [add_achievement, add_challenge]
-    }
-
-
-# LLM
-llm = ChatOpenAI(
-    model="gpt-4.1-mini", 
-    temperature=0.7, 
-    streaming=False,
-    api_key=OPENAI_API_KEY, 
-    max_completion_tokens=1024
+SYSTEM_ASK_GOAL = (
+    "Ты ассистент-коуч по здоровью. Спроси у пользователя, к какой цели он хочет прийти в работе с ботом: например, похудеть, набрать массу, улучшить сон и т.д. Не предлагай варианты, спроси свободно."
+)
+SYSTEM_ASK_FORM = (
+    "Ты умный ассистент по здоровью. Сообщи пользователю, что для него автоматически сгенерированы базовые параметры и покажи их. Предложи начать симуляцию с этими данными."
+)
+SYSTEM_ASK_NEXT = (
+    "Сделай мотивирующее сообщение (короткое) и покажи одну кнопку 'Следующий день', если пользователь готов перейти к следующему дню симуляции по контролю веса."
+)
+SYSTEM_REPORT = (
+    "Используя описанные ниже исторические данные пользователя (7 дней), создай для него краткий отчёт в стиле коуча-бота: что было лучше, что хуже, на что стоит обратить внимание. Добавь мотивационные советы. После отчёта пригласи пользователя сохранить прогресс и нажать 'Следующий день' для моделирования нового дня. Используй эмодзи. Баллы в выдаче не комментируй, выводи прогресс как достижение цели."
+)
+SYSTEM_DAILY_REPORT = (
+    "На основе сегодняшних данных скора и параметров создай короткий отчет-поддержку для пользователя (максимум 4 предложения). Если заметен прогресс, упомяни это. Заверши мотивацией и предложи продолжать на пути к цели."
+)
+SYSTEM_CHAT = (
+    "Ты ассистент-коуч по здоровью. Отвечай на вопросы пользователя, давай советы по здоровью, мотивируй. "
+    "Учитывай контекст диалога и цель пользователя. Будь дружелюбным и поддерживающим. "
+    "Если пользователь хочет продолжить симуляцию дней, предложи ему нажать кнопку 'Следующий день'."
 )
 
+# ================================
+#   Вспомогательные функции
+# ================================
 
-# Системные шаблоны (адаптированные для Telegram)
-ROUTER_SYSTEM_TEMPLATE = """
-Вы Роутер в Telegram боте для управления здоровьем и расписанием.
-Определите, к какому агенту направить запрос пользователя.
+def random_day_params(user_info: dict) -> Dict[str, Any]:
+    """
+    Генерирует параметры дня — приближенно на основе данных анкеты пользователя
+    """
+    # Для "лучших" исходных — больше excellent/good, худшие — хуже.
+    base = 3 if (user_info.get('активность', 'средний') in ['низкий']) else 4
+    activity_bias = base + (1 if user_info.get('спорт', 'нет') == 'да' else 0)
+    stress_magic = 1 if user_info.get('уровень стресса', '').lower() == 'высокий' else 0
 
-Доступные агенты:
-1. health_agent - Физическое здоровье (вода, упражнения, шаги, сон)
-2. mental_health_agent - Ментальное здоровье (настроение, стресс, медитация, социальные контакты)
-3. schedule_agent - Рабочее расписание (рабочие часы, перерывы, задачи, встречи)
-4. summary_agent - Подведение итогов дня (достижения, вызовы, общий анализ)
-
-Запрос пользователя: {user_request}
-Текущее состояние: {user_state}
-
-ВАЖНО: Ответ должен быть дружелюбным для Telegram чата.
-
-Отвечайте в JSON формате:
-{{
-  "next_agent": "название_агента",
-  "reasoning": "краткое обоснование",
-  "message_to_agent": "сообщение для агента"
-}}
-"""
-
-HEALTH_AGENT_SYSTEM_TEMPLATE = """
-Вы Агент физического здоровья в Telegram боте.
-Помогаете пользователю отслеживать физическое здоровье.
-
-Доступные инструменты:
-- log_water_intake: записать воду
-- log_exercise: записать упражнения  
-- log_steps: записать шаги
-- log_sleep: записать сон
-
-Текущие показатели:
-💧 Вода: {water_intake}л
-👣 Шаги: {steps_count}
-🏃 Упражнения: {exercise_minutes} мин
-😴 Сон: {sleep_hours} ч
-
-Запрос: {user_request}
-
-Цели дня: 2-3л воды, 10000+ шагов, 30+ мин упражнений, 7-9ч сна.
-
-Будьте дружелюбны и мотивирующи! Используйте эмодзи в ответах.
-"""
-
-MENTAL_HEALTH_AGENT_SYSTEM_TEMPLATE = """
-Вы Агент ментального здоровья в Telegram боте.
-Поддерживаете психическое благополучие пользователя.
-
-Доступные инструменты:
-- update_mood: обновить настроение (1-10)
-- update_stress: обновить стресс (1-10)
-- log_meditation: записать медитацию
-- log_social_interaction: записать общение
-
-Текущее состояние:
-😊 Настроение: {mood_score}/10
-😰 Стресс: {stress_level}/10  
-🧘 Медитация: {meditation_minutes} мин
-👥 Общение: {social_interactions}
-
-Запрос: {user_request}
-
-Будьте эмпатичны и поддерживающи. Предлагайте конкретные техники.
-Используйте эмодзи для создания теплой атмосферы.
-"""
-
-SCHEDULE_AGENT_SYSTEM_TEMPLATE = """
-Вы Агент рабочего расписания в Telegram боте.
-Помогаете с организацией рабочего времени.
-
-Доступные инструменты:
-- log_work_hours: записать рабочие часы
-- log_break: записать перерыв
-- complete_task: отметить задачу
-- log_meeting: записать встречу
-
-Текущие показатели:
-⏰ Работа: {work_hours}ч
-☕ Перерывы: {breaks_taken}
-✅ Задачи: {tasks_completed}
-🤝 Встречи: {meetings_attended}
-
-Запрос: {user_request}
-
-Помогайте планировать и поддерживать work-life баланс.
-Используйте деловые эмодзи и будьте конструктивны.
-"""
-
-SUMMARY_AGENT_SYSTEM_TEMPLATE = """
-Вы Агент подведения итогов в Telegram боте.
-Анализируете день пользователя и помогаете с рефлексией.
-
-Доступные инструменты:
-- add_achievement: добавить достижение
-- add_challenge: добавить вызов
-
-Состояние пользователя: {full_user_state}
-Последние активности: {daily_activities}
-Достижения: {achievements}
-Вызовы: {challenges}
-
-Запрос: {user_request}
-
-Будьте позитивны и мотивирующи. Выделяйте прогресс и рост.
-Используйте эмодзи для создания вдохновляющей атмосферы.
-"""
-
-
-class HealthScheduleState(MessagesState):
-    """Состояние для системы управления здоровьем и расписанием"""
-    user_id: int
-    user_request: str
-    current_agent: str
-    next_agent: str
-    conversation_complete: bool
-    last_agent_response: str
-    routing_decision: str
-
-
-# Агенты системы
-def create_agents_for_user(user_id: int):
-    """Создает агентов для конкретного пользователя"""
-    user_state = get_user_state(user_id)
-    tools_dict = create_user_tools(user_id)
-    
-    def router_agent(state: HealthScheduleState) -> Dict:
-        logger.info(f"[Router] User {user_id}: Processing request")
-        
-        system_message = ROUTER_SYSTEM_TEMPLATE.format(
-            user_request=state["user_request"],
-            user_state=user_state.get_health_summary()
-        )
-        
-        response = llm.invoke([
-            SystemMessage(content=system_message),
-            HumanMessage(content=state["user_request"])
-        ])
-        
-        try:
-            parsed_response = json.loads(response.content)
-            next_agent = parsed_response.get("next_agent", "health_agent")
-            reasoning = parsed_response.get("reasoning", "")
-            message_to_agent = parsed_response.get("message_to_agent", "")
-            
-            logger.info(f"[Router] User {user_id}: Routing to {next_agent}")
-            
-            return {
-                "messages": state["messages"] + [response],
-                "next_agent": next_agent,
-                "current_agent": "router",
-                "routing_decision": reasoning,
-                "last_agent_response": message_to_agent
-            }
-        except json.JSONDecodeError as e:
-            logger.error(f"[Router] JSON parsing error: {e}")
-            return {
-                "messages": state["messages"] + [response],
-                "next_agent": "health_agent",
-                "current_agent": "router"
-            }
-
-    def health_agent(state: HealthScheduleState) -> Dict:
-        logger.info(f"[Health Agent] User {user_id}: Processing health request")
-        
-        system_message = HEALTH_AGENT_SYSTEM_TEMPLATE.format(
-            water_intake=user_state.water_intake,
-            steps_count=user_state.steps_count,
-            exercise_minutes=user_state.exercise_minutes,
-            sleep_hours=user_state.sleep_hours,
-            user_request=state["user_request"]
-        )
-        
-        llm_with_tools = llm.bind_tools(tools_dict['health_tools'])
-        response = llm_with_tools.invoke([
-            SystemMessage(content=system_message),
-            HumanMessage(content=state["user_request"])
-        ])
-        
-        return {
-            "messages": state["messages"] + [response],
-            "current_agent": "health_agent",
-            "next_agent": "complete",
-            "last_agent_response": response.content
-        }
-
-    def mental_health_agent(state: HealthScheduleState) -> Dict:
-        logger.info(f"[Mental Health Agent] User {user_id}: Processing mental health request")
-        
-        system_message = MENTAL_HEALTH_AGENT_SYSTEM_TEMPLATE.format(
-            mood_score=user_state.mood_score,
-            stress_level=user_state.stress_level,
-            meditation_minutes=user_state.meditation_minutes,
-            social_interactions=user_state.social_interactions,
-            user_request=state["user_request"]
-        )
-        
-        llm_with_tools = llm.bind_tools(tools_dict['mental_health_tools'])
-        response = llm_with_tools.invoke([
-            SystemMessage(content=system_message),
-            HumanMessage(content=state["user_request"])
-        ])
-        
-        return {
-            "messages": state["messages"] + [response],
-            "current_agent": "mental_health_agent",
-            "next_agent": "complete",
-            "last_agent_response": response.content
-        }
-
-    def schedule_agent(state: HealthScheduleState) -> Dict:
-        logger.info(f"[Schedule Agent] User {user_id}: Processing schedule request")
-        
-        system_message = SCHEDULE_AGENT_SYSTEM_TEMPLATE.format(
-            work_hours=user_state.work_hours,
-            breaks_taken=user_state.breaks_taken,
-            tasks_completed=len(user_state.tasks_completed),
-            meetings_attended=user_state.meetings_attended,
-            user_request=state["user_request"]
-        )
-        
-        llm_with_tools = llm.bind_tools(tools_dict['schedule_tools'])
-        response = llm_with_tools.invoke([
-            SystemMessage(content=system_message),
-            HumanMessage(content=state["user_request"])
-        ])
-        
-        return {
-            "messages": state["messages"] + [response],
-            "current_agent": "schedule_agent", 
-            "next_agent": "complete",
-            "last_agent_response": response.content
-        }
-
-    def summary_agent(state: HealthScheduleState) -> Dict:
-        logger.info(f"[Summary Agent] User {user_id}: Processing summary request")
-        
-        system_message = SUMMARY_AGENT_SYSTEM_TEMPLATE.format(
-            full_user_state=user_state.get_health_summary(),
-            daily_activities=user_state.daily_activities[-5:],
-            achievements=user_state.achievements,
-            challenges=user_state.challenges,
-            user_request=state["user_request"]
-        )
-        
-        llm_with_tools = llm.bind_tools(tools_dict['summary_tools'])
-        response = llm_with_tools.invoke([
-            SystemMessage(content=system_message),
-            HumanMessage(content=state["user_request"])
-        ])
-        
-        return {
-            "messages": state["messages"] + [response],
-            "current_agent": "summary_agent",
-            "next_agent": "complete",
-            "conversation_complete": True,
-            "last_agent_response": response.content
-        }
-
-    return {
-        'router': router_agent,
-        'health_agent': health_agent,
-        'mental_health_agent': mental_health_agent,
-        'schedule_agent': schedule_agent,
-        'summary_agent': summary_agent,
-        'all_tools': sum(tools_dict.values(), [])
+    params = {
+        "дата": "",
+        "сон": random.choices(CATS, [0.1, 0.30, 0.30, 0.30])[0],
+        "активность": random.choices(CATS, [0.10, 0.30, 0.3, 0.3])[0] if activity_bias > 3 else random.choices(CATS, [0.2, 0.3, 0.3, 0.2])[0],
+        "питание": random.choices(CATS, [0.15, 0.40, 0.30, 0.15])[0],
+        "лекарства": random.choice(YN),
+        "чтение": random.choice(YN),
+        "ментальное": random.choices(CATS, [0.15, 0.35, 0.35, 0.15])[0] if not stress_magic else random.choices(CATS, [0,0.20,0.40,0.40])[0],
+        "медитация": random.choice(YN),
+        "спорт": random.choice(YN if activity_bias > 3 else ["нет", "нет", "да", "нет"]),
+        "нагрузка по работе": random.choices(CATS, [0.25, 0.4, 0.25, 0.10])[0]
     }
+    logger.debug(f"Random day params generated: {params}")
+    return params
 
+def params_to_score(params: Dict[str,Any]) -> float:
+    """
+    Выставляет дробный скор за 1 день — max 5 баллов
+    """
+    score = 0.0
+    mapping = {"отлично": 1.0, "хорошо": 0.75, "удовлетворительно": 0.45, "плохо": 0.10}
+    # Сон, активность, питание, ментальное, нагрузка по работе: 0...1 за каждый
+    for key in ["сон", "активность", "питание", "ментальное", "нагрузка по работе"]:
+        score += mapping.get(params[key], 0.10)
+    # за спорт и медитацию, чтение — +0.25 каждая если были (да)
+    for k in ["медитация", "спорт", "чтение"]:
+        score += 0.25 if params.get(k,"нет")=="да" else 0.0
+    # за лекарства да — не штрафуем, за нет — не штрафуем
+    return min(score, 5.0)
 
-def build_user_graph(user_id: int):
-    """Создает граф для конкретного пользователя"""
-    agents = create_agents_for_user(user_id)
-    
-    builder = StateGraph(HealthScheduleState)
-    
-    # Добавляем узлы
-    builder.add_node("router", agents['router'])
-    builder.add_node("health_agent", agents['health_agent'])
-    builder.add_node("mental_health_agent", agents['mental_health_agent'])
-    builder.add_node("schedule_agent", agents['schedule_agent'])
-    builder.add_node("summary_agent", agents['summary_agent'])
-    builder.add_node("tools", ToolNode(agents['all_tools']))
-    
-    # Стартовый узел
-    builder.add_edge(START, "router")
-    
-    # Маршрутизация от роутера
-    builder.add_conditional_edges(
-        "router",
-        lambda x: x["next_agent"],
-        {
-            "health_agent": "health_agent",
-            "mental_health_agent": "mental_health_agent",
-            "schedule_agent": "schedule_agent", 
-            "summary_agent": "summary_agent"
-        }
+def humanify_params(params):
+    lines = []
+    for k,v in params.items():
+        if k == "дата": continue
+        vv = "✅" if v=="да" else v if v not in YN else "❌"
+        lines.append(f"{k.title()}: {vv}")
+    return "; ".join(lines)
+
+def score_progress_bar(score, maxv=25):
+    filled = int(score / maxv * 20)
+    return "🏁 " + "█"*filled + "-"*(20-filled) + f" {score:.1f}/{maxv}"
+
+def make_7days_history(user_info):
+    d0 = datetime.now() - timedelta(days=6)
+    out = []
+    for i in range(7):
+        p = random_day_params(user_info)
+        p['дата'] = (d0+timedelta(days=i)).strftime("%d.%m")
+        p['скор'] = round(params_to_score(p),2)
+        out.append(p)
+    logger.info(f"7 days history generated for params: {user_info}")
+    logger.debug(f"History: {out}")
+    return out
+
+def next_day(user_state: UserHealthState):
+    ui = user_state.input_answers
+    day_params = random_day_params(ui)
+    day_params['дата'] = (datetime.now()+timedelta(days=user_state.current_day)).strftime("%d.%m")
+    day_params['скор'] = round(params_to_score(day_params),2)
+    logger.info(f"Next simulated day generated for user_id={user_state.user_id}: {day_params}")
+    return day_params
+
+def format_user_params(user_info: dict) -> str:
+    """Форматирует параметры пользователя для отображения"""
+    return (
+        f"👤 Ваши параметры:\n"
+        f"• Пол: {user_info.get('пол', 'не указан')}\n"
+        f"• Возраст: {user_info.get('возраст', 'не указан')} лет\n"
+        f"• Рост: {user_info.get('рост', 'не указан')} см\n"
+        f"• Вес: {user_info.get('вес', 'не указан')} кг\n"
+        f"• Активность: {user_info.get('активность', 'не указана')}\n"
+        f"• Уровень стресса: {user_info.get('уровень стресса', 'не указан')}\n"
+        f"• Курение: {user_info.get('курение', 'не указано')}\n"
+        f"• Алкоголь: {user_info.get('алкоголь', 'не указано')}\n"
+        f"• Спорт: {user_info.get('спорт', 'не указано')}\n"
+        f"• Чтение: {user_info.get('чтение', 'не указано')}\n"
+        f"• Медитация: {user_info.get('медитация', 'не указано')}"
     )
-    
-    # Условные переходы для инструментов
-    def should_use_tools(state):
-        if not state["messages"]:
-            return "no_tools"
-        last_message = state["messages"][-1]
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            return "use_tools"
-        return "no_tools"
-    
-    for agent_name in ["health_agent", "mental_health_agent", "schedule_agent", "summary_agent"]:
-        builder.add_conditional_edges(
-            agent_name,
-            should_use_tools,
-            {"use_tools": "tools", "no_tools": END}
-        )
-    
-    builder.add_edge("tools", END)
-    
-    return builder.compile()
 
+# FSM Dictionary (by user_id) - ключ состояния в анкете
+daily_form_fields = [
+    ("пол", "Укажите, пожалуйста, ваш пол (мужчина/женщина)"),
+    ("возраст", "Ваш возраст (число лет):"),
+    ("рост", "Ваш рост в сантиметрах:"),
+    ("вес", "Ваш вес (в кг):"),
+    ("активность", "Опишите ваш уровень ежедневной активности: низкий, средний или высокий?"),
+    ("уровень стресса", "Какой у вас уровень стресса обычно: низкий, средний или высокий?"),
+    ("курение", "Курите ли вы? (да/нет)"),
+    ("алкоголь", "Употребляете ли вы алкоголь? (да/нет)")
+]
 
-async def process_user_request(user_id: int, user_request: str) -> str:
-    """Обрабатывает запрос пользователя через систему агентов"""
+# ================================
+#   LLM-помощник (вопросы и отчёты)
+# ================================
+def call_llm(messages: List[HumanMessage|SystemMessage]) -> str:
     try:
-        logger.info(f"Processing request from user {user_id}: {user_request}")
-        
-        # Создаем граф для пользователя
-        graph = build_user_graph(user_id)
-        
-        # Начальное состояние
-        initial_state = {
-            "user_id": user_id,
-            "messages": [],
-            "user_request": user_request,
-            "current_agent": "",
-            "next_agent": "router",
-            "conversation_complete": False,
-            "last_agent_response": "",
-            "routing_decision": ""
-        }
-        
-        # Запускаем граф
-        final_state = graph.invoke(initial_state, {"recursion_limit": 10})
-        
-        # Получаем последний ответ
-        if final_state["messages"]:
-            last_message = final_state["messages"][-1]
-            response_text = last_message.content
-            
-            # Если есть вызовы инструментов, добавляем их результаты
-            if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                response_text += "\n\n✅ Данные записаны!"
-            
-            return response_text
-        else:
-            return "Извините, произошла ошибка при обработке вашего запроса."
-            
+        logger.info("Calling LLM for response")
+        logger.debug(f"LLM Messages: {messages}")
+        response = llm.invoke(messages)
+        logger.debug(f"LLM raw response: {getattr(response, 'content', None)}")
+        return response.content.strip()
     except Exception as e:
-        logger.error(f"Error processing request for user {user_id}: {e}")
-        return f"Произошла ошибка: {str(e)}"
+        logger.error(f"LLM Call error: {e}")
+        return "🤖 Ошибка при генерации ответа. Попробуйте ещё раз."
 
+def ask_goal_message(user_state:UserHealthState):
+    context = user_state.get_context()
+    return call_llm([SystemMessage(SYSTEM_ASK_GOAL), HumanMessage(context)])
 
-# Telegram Bot Handlers
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    """Обработчик команд /start и /help"""
-    user_id = message.from_user.id
-    
-    # Создаем пользователя если его нет
-    get_user_state(user_id)
-    
-    welcome_text = """
-🌟 *Добро пожаловать в бота управления здоровьем!* 🌟
+def ask_form_message(user_state:UserHealthState):
+    context = user_state.get_context()
+    params_text = format_user_params(user_state.input_answers)
+    return call_llm([SystemMessage(SYSTEM_ASK_FORM), HumanMessage(f"{context}\n\n{params_text}")])
 
-Я помогу вам отслеживать:
-💪 Физическое здоровье (вода, упражнения, шаги, сон)
-🧠 Ментальное состояние (настроение, стресс, медитация)
-💼 Рабочее расписание (задачи, встречи, перерывы)
-📊 Подведение итогов дня
+def report_history_message(user_state:UserHealthState):
+    # Сделать компактный json историю пользователя
+    user_days = user_state.history_data
+    summary = "\n".join([
+        f"{d['дата']}: {humanify_params(d)} (скор: {d['скор']})" for d in user_days
+    ])
+    system = SYSTEM_REPORT+f"\n---\nИстория:\n{summary}\n---\nЦель пользователя: {user_state.health_goal or ''}\n"
+    return call_llm([SystemMessage(system)])
 
-*Примеры сообщений:*
-• "Выпил 2 стакана воды"
-• "Прошел 5000 шагов" 
-• "Настроение 8 из 10"
-• "Работал 4 часа"
-• "Подведи итоги дня"
+def day_report_message(user_state:UserHealthState, day_dict:dict):
+    short_data = ", ".join([f"{k}:{v}" for k,v in day_dict.items() if k!="дата"])
+    context = f"Сегодня: {short_data}\nОбщий балл: {user_state.total_score:.1f} из 25"
+    system = SYSTEM_DAILY_REPORT
+    return call_llm([SystemMessage(system), HumanMessage(context)])
 
-*Команды:*
-/stats - показать статистику дня
-/reset - сбросить данные дня
-/help - показать эту справку
+def chat_response(user_state: UserHealthState, user_message: str):
+    context = user_state.get_context()
+    goal_info = f"Цель пользователя: {user_state.health_goal or 'не указана'}"
+    progress_info = f"Текущий прогресс: день {user_state.current_day}, баллы {user_state.total_score:.1f}"
+    system_msg = f"{SYSTEM_CHAT}\n\n{goal_info}\n{progress_info}"
+    messages = [SystemMessage(system_msg), HumanMessage(f"Контекст диалога:\n{context}\n\nПоследнее сообщение пользователя: {user_message}")]
+    response = call_llm(messages)
+    logger.info(f"LLM response: {response}")
+    return response
 
-Просто пишите мне о своих активностях, и я все запишу! 📝
-"""
-    
-    bot.reply_to(message, welcome_text, parse_mode='Markdown')
-
-
-@bot.message_handler(commands=['stats'])
-def send_stats(message):
-    """Показать статистику пользователя"""
-    user_id = message.from_user.id
-    user_state = get_user_state(user_id)
-    
-    stats_text = user_state.get_daily_summary_text()
-    bot.reply_to(message, stats_text, parse_mode='Markdown')
-
-
-@bot.message_handler(commands=['reset'])
-def reset_user_data(message):
-    """Сброс данных пользователя"""
-    user_id = message.from_user.id
-    
-    # Создаем клавиатуру подтверждения
+def next_button_markup():
     markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("✅ Да, сбросить", callback_data=f"reset_confirm_{user_id}"),
-        types.InlineKeyboardButton("❌ Отмена", callback_data="reset_cancel")
-    )
-    
-    bot.reply_to(
-        message, 
-        "⚠️ Вы уверены, что хотите сбросить все данные за сегодня?", 
-        reply_markup=markup
-    )
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("reset"))
-def handle_reset_callback(call):
-    """Обработчик подтверждения сброса данных"""
-    if call.data.startswith("reset_confirm"):
-        user_id = int(call.data.split("_")[-1])
-        
-        # Сбрасываем данные пользователя
-        user_states[user_id] = UserHealthState(user_id=user_id)
-        
-        bot.edit_message_text(
-            "✅ Данные успешно сброшены! Начните новый день с чистого листа 🌅",
-            call.message.chat.id,
-            call.message.message_id
-        )
-        logger.info(f"User {user_id} reset their data")
-        
-    elif call.data == "reset_cancel":
-        bot.edit_message_text(
-            "❌ Сброс отменен. Ваши данные сохранены.",
-            call.message.chat.id,
-            call.message.message_id
-        )
-
-
-@bot.message_handler(func=lambda message: True)
-def handle_user_message(message):
-    """Основной обработчик сообщений пользователей"""
-    user_id = message.from_user.id
-    user_request = message.text
-    
-    logger.info(f"Received message from user {user_id}: {user_request}")
-    
-    # Отправляем индикатор "печатаю"
-    bot.send_chat_action(message.chat.id, 'typing')
-    
-    try:
-        # Используем синхронную версию для совместимости с telebot
-        response = process_user_request_sync(user_id, user_request)
-        
-        # Отправляем ответ
-        bot.reply_to(message, response, parse_mode='Markdown')
-        
-    except Exception as e:
-        logger.error(f"Error handling message from user {user_id}: {e}")
-        bot.reply_to(
-            message, 
-            "😕 Произошла ошибка при обработке вашего сообщения. Попробуйте еще раз или обратитесь к /help"
-        )
-
-
-def process_user_request_sync(user_id: int, user_request: str) -> str:
-    """Синхронная версия обработки запроса пользователя"""
-    try:
-        logger.info(f"Processing request from user {user_id}: {user_request}")
-        
-        # Создаем граф для пользователя
-        graph = build_user_graph(user_id)
-        
-        # Начальное состояние
-        initial_state = {
-            "user_id": user_id,
-            "messages": [],
-            "user_request": user_request,
-            "current_agent": "",
-            "next_agent": "router",
-            "conversation_complete": False,
-            "last_agent_response": "",
-            "routing_decision": ""
-        }
-        
-        # Запускаем граф
-        final_state = graph.invoke(initial_state, {"recursion_limit": 10})
-        
-        # Получаем последний ответ
-        if final_state["messages"]:
-            last_message = final_state["messages"][-1]
-            response_text = last_message.content
-            
-            # Если есть вызовы инструментов, добавляем подтверждение
-            if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                response_text += "\n\n✅ *Данные успешно записаны!*"
-            
-            # Ограничиваем длину ответа для Telegram
-            if len(response_text) > 4000:
-                response_text = response_text[:3900] + "\n\n... (сообщение обрезано)"
-            
-            return response_text
-        else:
-            return "😕 Извините, произошла ошибка при обработке вашего запроса."
-            
-    except Exception as e:
-        logger.error(f"Error processing request for user {user_id}: {e}")
-        return f"❌ Произошла ошибка: {str(e)[:200]}..."
-
-
-def create_daily_report_keyboard():
-    """Создает клавиатуру для быстрых действий"""
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    
-    # Первый ряд - физическое здоровье
-    markup.row("💧 Выпил воду", "👣 Прошел шаги")
-    markup.row("🏃 Упражнения", "😴 Записать сон")
-    
-    # Второй ряд - ментальное здоровье  
-    markup.row("😊 Настроение", "😰 Уровень стресса")
-    markup.row("🧘 Медитация", "👥 Общение")
-    
-    # Третий ряд - работа
-    markup.row("💼 Рабочие часы", "✅ Выполнил задачу")
-    markup.row("☕ Перерыв", "🤝 Встреча")
-    
-    # Четвертый ряд - итоги и статистика
-    markup.row("📊 Статистика", "🌟 Итоги дня")
-    
+    markup.add(types.InlineKeyboardButton("Следующий день", callback_data="next_sim_day"))
     return markup
 
+def params_choice_markup():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🎲 Сгенерировать параметры", callback_data="generate_params"))
+    markup.add(types.InlineKeyboardButton("✏️ Ввести параметры самому", callback_data="input_params"))
+    return markup
 
-@bot.message_handler(commands=['keyboard'])
-def show_keyboard(message):
-    """Показать клавиатуру быстрых действий"""
-    markup = create_daily_report_keyboard()
-    bot.reply_to(
-        message,
-        "🎯 Используйте кнопки для быстрого ввода данных или пишите свободным текстом:",
-        reply_markup=markup
+def main_menu_markup():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Следующий день", callback_data="next_sim_day"))
+    markup.add(types.InlineKeyboardButton("💬 Чат с ботом", callback_data="start_chat"))
+    return markup
+
+def start_simulation_markup():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🚀 Начать симуляцию", callback_data="start_simulation"))
+    return markup
+
+def detect_user_intent(user_goal: str) -> str:
+    """
+    Обращается к LLM для детекции типа намерения пользователя.
+    Возвращает один из вариантов: 'похудеть', 'набрать массу', 'улучшить сон', 'другое'
+    """
+    prompt = (
+        "Пользователь назвал свою цель в работе над здоровьем. "
+        "Определи, к какой из категорий она относится: "
+        "1) похудеть (снизить вес, сбросить кг и т.п.), "
+        "2) набрать массу, "
+        "3) улучшить сон, "
+        "4) другое. "
+        "Только одна категория, без лишних символов, выведи ответ одним словом из этого списка: ['похудеть', 'набрать массу', 'улучшить сон', 'другое']"
+        f"\n\nЦель пользователя: {user_goal}"
+    )
+    response = call_llm([SystemMessage(prompt)])
+    return response.lower().strip()
+
+# ================================
+#         BOT HANDLERS FSM
+# ================================
+
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    user = get_user(message.from_user.id)
+    logger.info(f"/start command invoked by user_id={message.from_user.id}")
+    user.reset_dialog()
+    user.interaction_state = 'goal'
+    logger.info(f"State updated: user_id={user.user_id}, interaction_state='goal'")
+    welcome = "👋 Добро пожаловать! Я ваш цифровой помощник для контроля и улучшения здоровья.\n\n"
+    question = ask_goal_message(user)
+    bot.send_message(message.chat.id, f"{welcome}{question}")
+    user.add_message(question, from_user=False)
+
+@bot.message_handler(commands=['help'])
+def help_handler(message):
+    user = get_user(message.from_user.id)
+    logger.info(f"/help command invoked by user_id={message.from_user.id}")
+    user.add_message(message.text, from_user=True)
+    bot.reply_to(message, (
+        "🤖 Я помогу вести путь к вашей цели (похудение, улучшение самочувствия и т.д.). "
+        "Для старта отправьте /start. Вся логика поддерживает кнопки и диалог."
+    ))
+
+@bot.message_handler(func=lambda m: True)
+def handle_all(message):
+    user = get_user(message.from_user.id)
+    text = message.text.strip()
+    logger.info(f"Received message from user_id={user.user_id}: {text}")
+    user.add_message(text, from_user=True)
+
+    # FSM — этап выбора цели
+    if user.interaction_state == "goal":
+        user.health_goal = text
+        logger.info(f"User goal set: user_id={user.user_id} | goal={text}")
+        intent = detect_user_intent(text)
+        logger.info(f"User goal intent resolved: {intent}")
+
+        if intent == "похудеть":
+            # Генерируем параметры автоматически
+            user.generate_default_params()
+            user.interaction_state = 'collect_data'
+            logger.info(f"State updated: user_id={user.user_id}, interaction_state='collect_data'")
+            ask = ask_form_message(user)
+            bot.send_message(message.chat.id, ask, reply_markup=start_simulation_markup())
+            user.add_message(ask, from_user=False)
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Пока поддерживается только цель 'похудеть'. Пожалуйста, напишите свою цель, если вы хотите похудеть."
+            )
+        return
+
+    # FSM — этап сбора формы (теперь автоматический)
+    if user.interaction_state == "collect_data":
+        logger.info(f"Collecting data from user_id={user.user_id} during 'collect_data' FSM stage")
+        response = chat_response(user, text)
+        bot.send_message(message.chat.id, response, reply_markup=start_simulation_markup())
+        user.add_message(response, from_user=False)
+        return
+
+    # FSM — ввод параметров пользователем
+    if user.waiting_for_params:
+        try:
+            logger.info(f"User entered custom params for day history: user_id={user.user_id}")
+            # Парсим ввод пользователя (ожидаем формат: сон=хорошо, активность=отлично, и т.д.)
+            params = {}
+            pairs = text.split(',')
+            for pair in pairs:
+                if '=' in pair:
+                    key, value = pair.split('=', 1)
+                    params[key.strip()] = value.strip()
+
+            # Генерируем историю с пользовательскими параметрами
+            form_info = user.input_answers.copy()
+            form_info.update(params)
+            hist = make_7days_history(form_info)
+            user.history_data = hist
+            user.total_score = float(sum(d['скор'] for d in hist))
+            user.current_day = 7
+            user.interaction_state = "showing_history"
+            user.waiting_for_params = False
+            logger.info(f"History for entered params generated for user_id={user.user_id}")
+            report = report_history_message(user)
+            bar = score_progress_bar(user.total_score)
+            bot.send_message(message.chat.id, f"{report}\n\n{bar}", reply_markup=main_menu_markup())
+            user.add_message(report, from_user=False)
+        except Exception as e:
+            logger.error(f"Error parsing or generating history for user_id={user.user_id}: {e}")
+            bot.send_message(message.chat.id, "Ошибка в формате. Попробуйте еще раз в формате: сон=хорошо, активность=отлично")
+        return
+
+    # FSM — режим чата
+    if user.interaction_state == "chat":
+        logger.info(f"User entered message in chat mode: user_id={user.user_id}")
+        response = chat_response(user, text)
+        bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+        user.add_message(response, from_user=False)
+        return
+
+    # FSM — показываем историю, ждем действия (кнопку)
+    if user.interaction_state == "showing_history":
+        logger.info(f"User interacted during showing_history: user_id={user.user_id}")
+        response = chat_response(user, text)
+        bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+        user.add_message(response, from_user=False)
+        return
+
+    # FSM — обработка новых дней после старта 7-дневки
+    if user.interaction_state == "daily_update":
+        logger.info(f"User interacted during daily_update: user_id={user.user_id}")
+        response = chat_response(user, text)
+        bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+        user.add_message(response, from_user=False)
+        return
+
+    # --- Если не FSM — запускать основного Health-LLM или отвечать дефолтом
+    logger.info(f"No valid FSM state matched for user_id={user.user_id}. Sent default reply.")
+    bot.reply_to(message, "👀 Пожалуйста, используйте /start для новой сессии похудения.\n(В этой демо-версии реализован только путь похудения с анализом по заданной анкете.)")
+
+@bot.callback_query_handler(func=lambda call: call.data == "start_simulation")
+def start_simulation_callback(call):
+    user = get_user(call.from_user.id)
+    logger.info(f"User {user.user_id} starts simulation (callback start_simulation)")
+    bot.edit_message_text("🔄 Генерирую вашу историю за 7 дней...",
+                         chat_id=call.message.chat.id,
+                         message_id=call.message.message_id)
+
+    # Генерация истории 7 дней
+    form_info = user.input_answers.copy()
+    hist = make_7days_history(form_info)
+    user.history_data = hist
+    user.total_score = float(sum(d['скор'] for d in hist))
+    user.current_day = 7
+    user.interaction_state = "showing_history"
+    logger.info(f"History generated and state updated for user_id={user.user_id}")
+    report = report_history_message(user)
+    bar = score_progress_bar(user.total_score)
+    bot.edit_message_text(f"{report}\n\n{bar}",
+                         chat_id=call.message.chat.id,
+                         message_id=call.message.message_id,
+                         reply_markup=main_menu_markup())
+    user.add_message(report, from_user=False)
+
+@bot.callback_query_handler(func=lambda call: call.data == "generate_params")
+def generate_params_callback(call):
+    user = get_user(call.from_user.id)
+    logger.info(f"User {user.user_id} requested generate_params callback")
+    bot.edit_message_text("🔄 Генерирую вашу историю за 7 дней...",
+                         chat_id=call.message.chat.id,
+                         message_id=call.message.message_id)
+
+    # Генерация истории 7 дней
+    form_info = user.input_answers.copy()
+    hist = make_7days_history(form_info)
+    user.history_data = hist
+    user.total_score = float(sum(d['скор'] for d in hist))
+    user.current_day = 7
+    user.interaction_state = "showing_history"
+    logger.info(f"History generated and state updated for user_id={user.user_id} (generate_params)")
+    report = report_history_message(user)
+    bar = score_progress_bar(user.total_score)
+    bot.edit_message_text(f"{report}\n\n{bar}",
+                         chat_id=call.message.chat.id,
+                         message_id=call.message.message_id,
+                         reply_markup=main_menu_markup())
+    user.add_message(report, from_user=False)
+
+    # Show generated default parameters to user
+    default_params_str = "\n".join(f"{k}: {v}" for k, v in user.input_answers.items())
+    bot.send_message(
+        chat_id=call.message.chat.id,
+        text=f"Сгенерированы параметры пользователя:\n{default_params_str}",
     )
 
+@bot.callback_query_handler(func=lambda call: call.data == "input_params")
+def input_params_callback(call):
+    user = get_user(call.from_user.id)
+    user.waiting_for_params = True
+    logger.info(f"User_id={user.user_id} requested to input_params (switch to waiting_for_params=True)")
+    params_text = (
+        "Введите ваши параметры в формате:\n"
+        "сон=хорошо, активность=отлично, питание=удовлетворительно, "
+        "медитация=да, спорт=нет, чтение=да\n\n"
+        "Доступные значения:\n"
+        "• Для сна, активности, питания, ментального состояния: отлично, хорошо, удовлетворительно, плохо\n"
+        "• Для медитации, спорта, чтения, лекарств: да, нет"
+    )
 
-@bot.message_handler(commands=['hide'])
-def hide_keyboard(message):
-    """Скрыть клавиатуру"""
-    markup = types.ReplyKeyboardRemove()
-    bot.reply_to(message, "👍 Клавиатура скрыта", reply_markup=markup)
+    bot.edit_message_text(params_text,
+                         chat_id=call.message.chat.id,
+                         message_id=call.message.message_id)
 
+@bot.callback_query_handler(func=lambda call: call.data == "start_chat")
+def start_chat_callback(call):
+    user = get_user(call.from_user.id)
+    user.interaction_state = "chat"
+    logger.info(f"User_id={user.user_id} switched to chat mode (interaction_state='chat')")
+    bot.edit_message_text("💬 Теперь вы в режиме чата! Задавайте любые вопросы о здоровье, питании, тренировках. Я помогу вам советами и мотивацией!",
+                         chat_id=call.message.chat.id,
+                         message_id=call.message.message_id,
+                         reply_markup=main_menu_markup())
 
-# Планировщик для отправки напоминаний
-def schedule_daily_reminders():
-    """Планирует ежедневные напоминания пользователям"""
-    import schedule
-    import time
-    from threading import Thread
-    
-    def send_morning_reminder():
-        """Утреннее напоминание"""
-        for user_id in user_states.keys():
-            try:
-                reminder_text = """
-🌅 *Доброе утро!* 
-
-Начните день правильно:
-💧 Выпейте стакан воды
-🧘 5 минут медитации
-📝 Поставьте цели на день
-
-Напишите мне о своих утренних активностях!
-"""
-                bot.send_message(user_id, reminder_text, parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"Error sending morning reminder to user {user_id}: {e}")
-    
-    def send_evening_reminder():
-        """Вечернее напоминание"""
-        for user_id in user_states.keys():
-            try:
-                reminder_text = """
-🌆 *Время подвести итоги дня!*
-
-Напишите мне:
-• Что удалось сегодня? 
-• Какие были вызовы?
-• Как себя чувствуете?
-
-Команда /stats покажет статистику дня 📊
-"""
-                bot.send_message(user_id, reminder_text, parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"Error sending evening reminder to user {user_id}: {e}")
-    
-    def send_water_reminder():
-        """Напоминание о воде"""
-        for user_id, user_state in user_states.items():
-            try:
-                if user_state.water_intake < 1.5:  # Если выпил меньше 1.5 литров
-                    bot.send_message(
-                        user_id, 
-                        f"💧 Напоминание: вы выпили {user_state.water_intake}л воды. Не забывайте пить!"
-                    )
-            except Exception as e:
-                logger.error(f"Error sending water reminder to user {user_id}: {e}")
-    
-    # Планируем напоминания
-    schedule.every().day.at("08:00").do(send_morning_reminder)
-    schedule.every().day.at("20:00").do(send_evening_reminder) 
-    schedule.every().hour.do(send_water_reminder)
-    
-    def run_scheduler():
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-    
-    # Запускаем планировщик в отдельном потоке
-    scheduler_thread = Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    logger.info("Daily reminders scheduler started")
-
-
-def export_user_data(user_id: int) -> str:
-    """Экспорт данных пользователя в JSON"""
-    user_state = get_user_state(user_id)
-    
-    export_data = {
-        "user_id": user_id,
-        "export_date": datetime.now().isoformat(),
-        "health_summary": user_state.get_health_summary(),
-        "daily_activities": user_state.daily_activities,
-        "achievements": user_state.achievements,
-        "challenges": user_state.challenges,
-        "tasks_completed": user_state.tasks_completed
-    }
-    
-    return json.dumps(export_data, ensure_ascii=False, indent=2)
-
-
-@bot.message_handler(commands=['export'])
-def export_data(message):
-    """Экспорт данных пользователя"""
-    user_id = message.from_user.id
-    
+@bot.callback_query_handler(func=lambda call: call.data == "next_sim_day")
+def next_sim_day_callback(call):
+    user = get_user(call.from_user.id)
+    logger.info(f"User_id={user.user_id} pressed next_sim_day (simulating next day)")
+    # Шаг 1: генерируем новый день
+    day_dict = next_day(user)
+    user.history_data.append(day_dict)
+    user.total_score += day_dict['скор']
+    user.current_day += 1
+    # Шаг 2: просим LLM сделать короткий отчёт
+    day_text = day_report_message(user, day_dict)
+    bar = score_progress_bar(user.total_score)
+    # Шаг 3: показать к-во дней — моделируем до 14!
+    report = f"{day_dict['дата']} — {humanify_params(day_dict)}\n*Сегодня: {day_dict['скор']:.2f} баллов*\n\n{day_text}\n\n{bar}"
+    # Кнопки
+    markup = main_menu_markup()
+    user.interaction_state = "daily_update"
+    logger.info(f"Daily update processed: user_id={user.user_id}, current_day={user.current_day}, total_score={user.total_score:.2f}")
     try:
-        export_json = export_user_data(user_id)
-        
-        # Создаем файл
-        filename = f"health_data_{user_id}_{datetime.now().strftime('%Y%m%d')}.json"
-        
-        bot.send_document(
-            message.chat.id,
-            document=export_json.encode('utf-8'),
-            visible_file_name=filename,
-            caption="📊 Ваши данные за сегодня"
+        bot.edit_message_text(
+            report, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup, parse_mode='Markdown'
         )
-        
     except Exception as e:
-        logger.error(f"Error exporting data for user {user_id}: {e}")
-        bot.reply_to(message, "❌ Ошибка при экспорте данных")
+        logger.error(f"Error editing message for user_id={user.user_id} in next_sim_day_callback: {e}")
+        bot.send_message(call.message.chat.id, report, reply_markup=markup, parse_mode='Markdown')
 
-
-# Функция для получения статистики бота
-def get_bot_statistics():
-    """Получает общую статистику бота"""
-    total_users = len(user_states)
-    active_users_today = sum(1 for state in user_states.values() if state.daily_activities)
-    total_activities = sum(len(state.daily_activities) for state in user_states.values())
+    # Show congratulation message if score exceeds threshold
+    if user.total_score > 25:
+        bot.send_message(call.message.chat.id, "🎉 Поздравляем! Ваш общий счет превысил пороговое значение 25!")
     
-    return {
-        "total_users": total_users,
-        "active_users_today": active_users_today, 
-        "total_activities": total_activities
-    }
+    # Если прошло 14 дней или больше — сбросить
+    if user.current_day >= 14:
+        logger.info(f"User_id={user.user_id} finished 14 days simulation, resetting dialog")
+        bot.send_message(call.message.chat.id, "🎉 Вы прошли 14 дней! Чтобы начать заново, отправьте /start")
+        user.reset_dialog()
 
-
-@bot.message_handler(commands=['admin'])
-def admin_stats(message):
-    """Команда для администратора (показать статистику бота)"""
-    # Здесь можно добавить проверку на права администратора
-    admin_ids = [22286014]  # Замените на ID администраторов
-    
-    if message.from_user.id not in admin_ids:
-        bot.reply_to(message, "❌ У вас нет прав администратора")
-        return
-    
-    stats = get_bot_statistics()
-    
-    admin_text = f"""
-🔧 *Статистика бота:*
-
-👥 Всего пользователей: {stats['total_users']}
-✅ Активных сегодня: {stats['active_users_today']}  
-📊 Всего активностей: {stats['total_activities']}
-
-Время работы: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
-    
-    bot.reply_to(message, admin_text, parse_mode='Markdown')
-
+# ================================
+#   Запуск
+# ================================
 
 def main():
-    """Основная функция запуска бота"""
-    logger.info("Starting Telegram Health Bot...")
-    
-    # Запускаем планировщик напоминаний
-    schedule_daily_reminders()
-    
-    # Информация о запуске
-    print("🤖 Telegram Health Bot запущен!")
-    print("📱 Отправьте /start боту для начала работы")
-    print("⚡ Нажмите Ctrl+C для остановки")
-    
-    # Запускаем бота
-    try:
-        bot.infinity_polling(timeout=10, long_polling_timeout=5)
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-        print("\n👋 Бот остановлен")
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
-        print(f"❌ Ошибка бота: {e}")
-
+    print("🤖 Telegram Health Coach Bot: стартуем!")
+    logger.info("Bot polling started")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 if __name__ == "__main__":
-    # Проверяем наличие токенов
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        print("❌ Установите TELEGRAM_BOT_TOKEN!")
-        exit(1)
-    
-    if OPENAI_API_KEY == "YOUR_OPENAI_API_KEY":
-        print("❌ Установите OPENAI_API_KEY!")
-        exit(1)
-    
-    main()
+    if not TELEGRAM_BOT_TOKEN :
+        print("❌ Требуются TELEGRAM_BOT_TOKEN в .env")
+    else:
+        main()

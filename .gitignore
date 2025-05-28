@@ -1,3 +1,5 @@
 health_bot.log
-py/.env
-.venv
+**/.env
+**/.venv
+py2/
+py3/
