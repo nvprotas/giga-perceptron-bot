@@ -240,10 +240,16 @@ def score_progress_bar(score, maxv=25):
 def make_7days_history(user_info):
     d0 = datetime.now() - timedelta(days=6)
     out = []
+    window_scores = []
     for i in range(7):
         p = random_day_params(user_info)
         p['дата'] = (d0+timedelta(days=i)).strftime("%d.%m")
-        p['скор'] = round(params_to_score(p),2)
+        score = round(params_to_score(p),2)
+        # Add current day's score to window
+        window_scores.append(score)
+        # Calculate window score as sum of last 7 days, here precisely the current ones in out
+        window_score = round(sum(window_scores), 2)
+        p['скор'] = window_score
         out.append(p)
     logger.info(f"7 days history generated for params: {user_info}")
     logger.debug(f"History: {out}")
@@ -528,11 +534,20 @@ def generate_params_callback(call):
                          chat_id=call.message.chat.id,
                          message_id=call.message.message_id)
 
-    # Генерация истории 7 дней
+    # Генерация истории 7 дней с ограничением по суммарному скору
     form_info = user.input_answers.copy()
     hist = make_7days_history(form_info)
+    total_score = float(sum(d['скор'] for d in hist))
+    attempts = 0
+    max_attempts = 10
+    while total_score > 25 and attempts < max_attempts:
+        hist = make_7days_history(form_info)
+        total_score = float(sum(d['скор'] for d in hist))
+        attempts += 1
+    if total_score > 25:
+        total_score = 24.0
     user.history_data = hist
-    user.total_score = float(sum(d['скор'] for d in hist))
+    user.total_score = total_score
     user.current_day = 7
     user.interaction_state = "showing_history"
     logger.info(f"History generated and state updated for user_id={user.user_id} (generate_params)")
@@ -608,7 +623,7 @@ def next_sim_day_callback(call):
     # Show congratulation message if score exceeds threshold
     if user.total_score > 25:
         bot.send_message(call.message.chat.id, "🎉 Поздравляем! Ваш общий счет превысил пороговое значение 25!")
-    
+
     # Если прошло 14 дней или больше — сбросить
     if user.current_day >= 14:
         logger.info(f"User_id={user.user_id} finished 14 days simulation, resetting dialog")
