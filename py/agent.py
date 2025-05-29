@@ -301,6 +301,7 @@ def call_llm(messages: List[HumanMessage|SystemMessage]) -> str:
         logger.info("Calling LLM for response")
         logger.debug(f"LLM Messages: {messages}")
         response = llm.invoke(messages)
+        logger.info(f"LLM response received: {getattr(response, 'content', None)}")
         logger.debug(f"LLM raw response: {getattr(response, 'content', None)}")
         return response.content.strip()
     except Exception as e:
