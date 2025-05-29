@@ -247,11 +247,26 @@ def params_to_score(params: Dict[str,Any]) -> float:
     return min(score, 5.0)
 
 def humanify_params(params):
+    # Красивое форматирование для дневного отчёта
+    order = [
+        "сон", "активность", "питание", "чтение", "ментальное", "медитация", "спорт", "нагрузка по работе"
+    ]
+    name_map = {
+        "сон": "Сон",
+        "активность": "Активность",
+        "питание": "Питание",
+        "чтение": "Чтение",
+        "ментальное": "Ментальное",
+        "медитация": "Медитация",
+        "спорт": "Спорт",
+        "нагрузка по работе": "Нагрузка по работе"
+    }
     lines = []
-    for k,v in params.items():
-        if k == "дата": continue
-        vv = "✅" if v=="да" else v if v not in YN else "❌"
-        lines.append(f"{k.title()}: {vv}")
+    for k in order:
+        if k in params:
+            v = params[k]
+            vv = "✅" if v == "да" else ("❌" if v == "нет" else v)
+            lines.append(f"{name_map[k]}: {vv}")
     return "; ".join(lines)
 
 def score_progress_bar(score, maxv=25):
@@ -725,8 +740,10 @@ def next_sim_day_callback(call):
     day_text = day_report_message(user, day_dict)
     bar = score_progress_bar(user.total_score)
     report = (
-        f"{day_dict['дата']} — {humanify_params(day_dict)}\n"
-        f"*Сегодня: {day_dict['скор']:.2f} баллов*\n\n"
+        f"📅 <b>{day_dict['дата']}</b>\n"
+        f"{humanify_params(day_dict)}\n"
+        f"<b>Скор:</b> <code>{day_dict['скор']:.2f}</code>\n"
+        f"<b>Сегодня:</b> <code>{day_dict['скор']:.2f}</code> баллов\n\n"
         f"{day_text}\n\n{bar}"
     )
 
@@ -738,11 +755,11 @@ def next_sim_day_callback(call):
             call.message.chat.id,
             report,
             reply_markup=main_menu_keyboard(),
-            parse_mode='Markdown'
+            parse_mode='HTML'
         )
     except Exception as e:
         logger.error(f"Error sending message: {e}")
-        bot.send_message(call.message.chat.id, report, reply_markup=main_menu_keyboard(), parse_mode='Markdown')
+        bot.send_message(call.message.chat.id, report, reply_markup=main_menu_keyboard(), parse_mode='HTML')
 
     # Конгратуляции, если порог превышен
     if user.total_score > 25:
