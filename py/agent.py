@@ -428,6 +428,16 @@ def handle_all(message):
             ask = ask_form_message(user)
             bot.send_message(message.chat.id, ask, reply_markup=start_simulation_markup())
             user.add_message(ask, from_user=False)
+            # Предложить программу похудения после генерации параметров
+            program_prompt = (
+                "На основе следующих параметров пользователя создай программу коррекции веса. "
+                "Опиши рекомендации по питанию, физической активности и режиму сна, чтобы помочь достичь цели. "
+                "Сделай текст мотивирующим и поддерживающим."
+            )
+            params_text = format_user_params(user.input_answers)
+            program_message = call_llm([SystemMessage(program_prompt), HumanMessage(params_text)])
+            bot.send_message(message.chat.id, program_message)
+            user.add_message(program_message, from_user=False)
         else:
             bot.send_message(
                 message.chat.id,
