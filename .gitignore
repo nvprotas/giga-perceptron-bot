@@ -3,3 +3,4 @@ health_bot.log
 **/.venv
 py2/
 py3/
+.aider*
