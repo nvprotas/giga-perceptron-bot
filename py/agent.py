@@ -321,7 +321,11 @@ def report_history_message(user_state:UserHealthState):
     summary = "\n".join([
         f"{d['дата']}: {humanify_params(d)} (скор: {d['скор']})" for d in user_days
     ])
-    system = SYSTEM_REPORT+f"\n---\nИстория:\n{summary}\n---\nЦель пользователя: {user_state.health_goal or ''}\n"
+    system = (
+        SYSTEM_REPORT
+        + "\nОграничь длину анализа 300 символами. Не превышай этот лимит.\n"
+        + f"\n---\nИстория:\n{summary}\n---\nЦель пользователя: {user_state.health_goal or ''}\n"
+    )
     return call_llm([SystemMessage(system)])
 
 def day_report_message(user_state:UserHealthState, day_dict:dict):
@@ -527,6 +531,7 @@ def start_simulation_callback(call):
         "Опиши рекомендации по питанию, физической активности и режиму сна, чтобы помочь достичь цели. "
         "Сделай текст мотивирующим и поддерживающим. "
         "История пользователя:\n"
+        "Ограничь длину плана 500 символами. Не превышай этот лимит."
     )
     # Формируем текст истории для передачи в LLM
     history_text = "\n".join([
