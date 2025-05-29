@@ -582,10 +582,11 @@ def handle_all(message):
             ])
             bot.send_message(
                 message.chat.id,
-                f"{report}\n\n{bar}\n\n📝 Ваш индивидуальный план похудения:\n\n{plan_message}",
+                # f"{report}\n\n{bar}\n\n📝 Ваш индивидуальный план похудения:\n\n{plan_message}",
+                f"📝 Я проанализировал ваши данные и подготовил ваш индивидуальный план похудения:\n\n{plan_message}",
                 reply_markup=main_menu_keyboard()
             )
-            user.add_message(report, from_user=False)
+            # user.add_message(report, from_user=False)
             user.add_message(plan_message, from_user=False)
         elif "нет изменений" in llm_response.lower():
             # Если LLM считает, что изменений нет, повторно просим подтвердить
