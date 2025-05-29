@@ -328,9 +328,12 @@ def ask_goal_message(user_state:UserHealthState):
     return call_llm([SystemMessage(SYSTEM_ASK_GOAL), HumanMessage(context)])
 
 def ask_form_message(user_state:UserHealthState):
-    context = user_state.get_context()
     params_text = format_user_params(user_state.input_answers)
-    return call_llm([SystemMessage(SYSTEM_ASK_FORM), HumanMessage(f"{context}\n\n{params_text}")])
+    return (
+        f"{params_text}\n\n"
+        "Проверьте, пожалуйста, корректны ли эти параметры. Если всё верно — напишите 'всё ок' или 'да'. "
+        "Если что-то не так — напишите, что нужно исправить."
+    )
 
 def report_history_message(user_state:UserHealthState):
     # Сделать компактный json историю пользователя
@@ -377,10 +380,7 @@ def main_menu_markup():
     markup.add(types.InlineKeyboardButton("Следующий день", callback_data="next_sim_day"))
     return markup
 
-def start_simulation_markup():
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📂 Загрузить исторические данные", callback_data="start_simulation"))
-    return markup
+# start_simulation_markup больше не нужен, так как кнопка не используется
 
 def detect_user_intent(user_goal: str) -> str:
     """
@@ -446,7 +446,7 @@ def handle_all(message):
             user.interaction_state = 'collect_data'
             logger.info(f"State updated: user_id={user.user_id}, interaction_state='collect_data'")
             ask = ask_form_message(user)
-            bot.send_message(message.chat.id, ask, reply_markup=start_simulation_markup())
+            bot.send_message(message.chat.id, ask)
             user.add_message(ask, from_user=False)
         else:
             # Общаемся с пользователем через LLM без стандартной отбивки
@@ -456,12 +456,57 @@ def handle_all(message):
             user.add_message(response, from_user=False)
         return
 
-    # FSM — этап сбора формы (теперь автоматический)
+    # FSM — этап подтверждения корректности параметров и генерации истории
     if user.interaction_state == "collect_data":
         logger.info(f"Collecting data from user_id={user.user_id} during 'collect_data' FSM stage")
-        response = chat_response(user, text)
-        bot.send_message(message.chat.id, response, reply_markup=start_simulation_markup())
-        user.add_message(response, from_user=False)
+        # Проверяем, подтвердил ли пользователь корректность параметров
+        ok_words = ["всё ок", "все ок", "да", "ок", "все хорошо", "всё хорошо", "верно", "правильно"]
+        if any(word in text.lower() for word in ok_words):
+            # Генерируем историю 7 дней
+            form_info = user.input_answers.copy()
+            hist = make_7days_history(form_info)
+            user.history_data = hist
+            user.total_score = float(sum(d['скор'] for d in hist))
+            user.current_day = 7
+            user.interaction_state = "showing_history"
+            logger.info(f"History for confirmed params generated for user_id={user.user_id}")
+            report = report_history_message(user)
+            bar = score_progress_bar(user.total_score)
+            bot.send_message(message.chat.id, f"{report}\n\n{bar}", reply_markup=main_menu_markup())
+            user.add_message(report, from_user=False)
+        else:
+            # Попробуем проанализировать ответ пользователя с помощью LLM и обновить параметры, если нужно
+            # Промпт для LLM: "Вот текущие параметры ... Пользователь написал: ... Какие параметры нужно изменить? Верни только изменённые значения в формате ключ=значение, через запятую."
+            params_text = format_user_params(user.input_answers)
+            prompt = (
+                "Вот текущие параметры пользователя:\n"
+                f"{params_text}\n"
+                f"Пользователь написал: {text}\n"
+                "Если пользователь указал, что нужно что-то изменить, верни только изменённые параметры в формате ключ=значение, через запятую. "
+                "Если изменений нет, верни 'нет изменений'."
+            )
+            llm_response = call_llm([SystemMessage(prompt)])
+            logger.info(f"LLM param correction response: {llm_response}")
+            if "нет изменений" in llm_response.lower():
+                # Если LLM считает, что изменений нет, повторно просим подтвердить
+                bot.send_message(message.chat.id, "Если всё верно, напишите 'всё ок' или 'да'. Если нужно что-то изменить, напишите, что именно.")
+            else:
+                # Парсим ответ LLM и обновляем параметры
+                try:
+                    pairs = llm_response.split(',')
+                    for pair in pairs:
+                        if '=' in pair:
+                            key, value = pair.split('=', 1)
+                            user.input_answers[key.strip()] = value.strip()
+                    # Показываем обновлённые параметры и снова просим подтвердить
+                    params_text = format_user_params(user.input_answers)
+                    bot.send_message(
+                        message.chat.id,
+                        f"Обновлённые параметры:\n{params_text}\n\nЕсли всё верно, напишите 'всё ок' или 'да'."
+                    )
+                except Exception as e:
+                    logger.error(f"Error parsing LLM param correction: {e}")
+                    bot.send_message(message.chat.id, "Не удалось распознать изменения. Пожалуйста, напишите, что нужно изменить, или подтвердите корректность параметров.")
         return
 
     # FSM — ввод параметров пользователем
@@ -533,50 +578,7 @@ def handle_all(message):
     logger.info(f"No valid FSM state matched for user_id={user.user_id}. Sent default reply.")
     bot.reply_to(message, "👀 Пожалуйста, используйте /start для новой сессии похудения.\n(В этой демо-версии реализован только путь похудения с анализом по заданной анкете.)")
 
-@bot.callback_query_handler(func=lambda call: call.data == "start_simulation")
-def start_simulation_callback(call):
-    user = get_user(call.from_user.id)
-    logger.info(f"User {user.user_id} starts simulation (callback start_simulation)")
-    bot.edit_message_text("📂 Загружаю историю за последние 7 дней...",
-                         chat_id=call.message.chat.id,
-                         message_id=call.message.message_id)
-
-    # Генерация истории 7 дней
-    form_info = user.input_answers.copy()
-    hist = make_7days_history(form_info)
-    user.history_data = hist
-    user.total_score = float(sum(d['скор'] for d in hist))
-    user.current_day = 7
-    user.interaction_state = "showing_history"
-    logger.info(f"History generated and state updated for user_id={user.user_id}")
-    report = report_history_message(user)
-    bar = score_progress_bar(user.total_score)
-    # Генерация индивидуального плана похудения на основе истории
-    plan_prompt = (
-        "На основе следующих параметров пользователя и его истории за 7 дней создай индивидуальную программу коррекции веса. "
-        "Учитывай динамику и особенности истории. "
-        "Опиши рекомендации по питанию, физической активности и режиму сна, чтобы помочь достичь цели. "
-        "Сделай текст мотивирующим и поддерживающим. "
-        "Длина плана должна быть от 1000 до 2000 символов. Не превышай этот лимит. "
-        "История пользователя:\n"
-    )
-    # Формируем текст истории для передачи в LLM
-    history_text = "\n".join([
-        f"{d['дата']}: {humanify_params(d)} (скор: {d['скор']})" for d in hist
-    ])
-    params_text = format_user_params(user.input_answers)
-    plan_message = call_llm([
-        SystemMessage(plan_prompt),
-        HumanMessage(f"{params_text}\n\n{history_text}")
-    ])
-    bot.edit_message_text(
-        f"{report}\n\n{bar}\n\n📝 Ваш индивидуальный план похудения:\n\n{plan_message}",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=main_menu_markup()
-    )
-    user.add_message(report, from_user=False)
-    user.add_message(plan_message, from_user=False)
+# Удалён обработчик callback start_simulation, так как кнопка больше не используется
 
 @bot.callback_query_handler(func=lambda call: call.data == "generate_params")
 def generate_params_callback(call):
