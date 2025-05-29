@@ -10,6 +10,7 @@ import telebot
 from telebot import types
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+import re
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -43,6 +44,7 @@ YN = ["да", "нет"]
 @dataclass
 class UserHealthState:
     user_id: int
+    user_name: Optional[str] = None
     dialog_history: List[str] = field(default_factory=list)
     interaction_state: Optional[str] = None      # FSM: None|'goal'|'collect_data'|'confirm_generation'|'showing_history'|'daily_update'|'chat'
     health_goal: Optional[str] = None
@@ -125,10 +127,14 @@ class UserHealthState:
 # users state storage:
 user_states: Dict[int, UserHealthState] = {}
 
-def get_user(user_id: int) -> UserHealthState:
+def get_user(user_id: int, user_name: Optional[str] = None) -> UserHealthState:
     if user_id not in user_states:
         logger.info(f"New user session started: user_id={user_id}")
-        user_states[user_id] = UserHealthState(user_id)
+        user_states[user_id] = UserHealthState(user_id, user_name=user_name)
+    else:
+        # обновим имя, если оно появилось
+        if user_name and not user_states[user_id].user_name:
+            user_states[user_id].user_name = user_name
     return user_states[user_id]
 
 # ================================
@@ -329,9 +335,10 @@ def ask_goal_message(user_state:UserHealthState):
 
 def ask_form_message(user_state:UserHealthState):
     params_text = format_user_params(user_state.input_answers)
+    name = user_state.user_name or "пользователь"
     return (
         f"{params_text}\n\n"
-        "Проверьте, пожалуйста, корректны ли эти параметры. Если всё верно — напишите 'всё ок' или 'да'. "
+        f"{name}, проверьте, пожалуйста, корректны ли эти параметры. Если всё верно — напишите 'всё ок' или 'да'. "
         "Если что-то не так — напишите, что нужно исправить."
     )
 
@@ -406,12 +413,15 @@ def detect_user_intent(user_goal: str) -> str:
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
-    user = get_user(message.from_user.id)
+    # Получаем имя пользователя из Telegram
+    tg_name = message.from_user.first_name or message.from_user.username or "пользователь"
+    user = get_user(message.from_user.id, user_name=tg_name)
     logger.info(f"/start command invoked by user_id={message.from_user.id}")
     user.reset_dialog()
+    user.user_name = tg_name
     user.interaction_state = 'goal'
     logger.info(f"State updated: user_id={user.user_id}, interaction_state='goal'")
-    welcome = "👋 Добро пожаловать! Я ваш цифровой помощник для контроля и улучшения здоровья.\n\n"
+    welcome = f"👋 Добро пожаловать, {tg_name}! Я ваш цифровой помощник для контроля и улучшения здоровья.\n\n"
     question = ask_goal_message(user)
     bot.send_message(message.chat.id, f"{welcome}{question}")
     user.add_message(question, from_user=False)
@@ -443,6 +453,14 @@ def handle_all(message):
         if intent == "коррекция веса":
             # Генерируем параметры автоматически
             user.generate_default_params()
+            # Попробуем определить пол по имени пользователя
+            if user.user_name:
+                # Примитивная эвристика: если имя оканчивается на "а" или "я" — женское
+                name = user.user_name.strip().lower()
+                if re.match(r".*[ая]$", name):
+                    user.input_answers["пол"] = "женщина"
+                else:
+                    user.input_answers["пол"] = "мужчина"
             user.interaction_state = 'collect_data'
             logger.info(f"State updated: user_id={user.user_id}, interaction_state='collect_data'")
             ask = ask_form_message(user)
