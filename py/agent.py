@@ -31,7 +31,7 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # Основные константы для скоров
 PARAMS = [
-    "сон", "активность", "питание", "лекарства", "чтение", "ментальное", "медитация", "спорт", "нагрузка по работе"
+    "сон", "активность", "питание", "чтение", "ментальное", "медитация", "спорт", "нагрузка по работе"
 ]
 CATS = ["отлично", "хорошо", "удовлетворительно", "плохо"]
 YN = ["да", "нет"]
@@ -200,7 +200,6 @@ def random_day_params(user_info: dict) -> Dict[str, Any]:
         "сон": random.choices(CATS, [0.1, 0.30, 0.30, 0.30])[0],
         "активность": random.choices(CATS, [0.10, 0.30, 0.3, 0.3])[0] if activity_bias > 3 else random.choices(CATS, [0.2, 0.3, 0.3, 0.2])[0],
         "питание": random.choices(CATS, [0.15, 0.40, 0.30, 0.15])[0],
-        "лекарства": random.choice(YN),
         "чтение": random.choice(YN),
         "ментальное": random.choices(CATS, [0.15, 0.35, 0.35, 0.15])[0] if not stress_magic else random.choices(CATS, [0,0.20,0.40,0.40])[0],
         "медитация": random.choice(YN),
@@ -222,7 +221,6 @@ def params_to_score(params: Dict[str,Any]) -> float:
     # за спорт и медитацию, чтение — +0.25 каждая если были (да)
     for k in ["медитация", "спорт", "чтение"]:
         score += 0.25 if params.get(k,"нет")=="да" else 0.0
-    # за лекарства да — не штрафуем, за нет — не штрафуем
     return min(score, 5.0)
 
 def humanify_params(params):
