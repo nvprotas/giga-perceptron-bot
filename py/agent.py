@@ -449,10 +449,11 @@ def handle_all(message):
             bot.send_message(message.chat.id, ask, reply_markup=start_simulation_markup())
             user.add_message(ask, from_user=False)
         else:
-            bot.send_message(
-                message.chat.id,
-                "Сейчас я могу помочь только с коррекцией веса, но я постоянно учусь и совсем скоро смогу поддержать и другие цели."
-            )
+            # Общаемся с пользователем через LLM без стандартной отбивки
+            user.interaction_state = "chat"
+            response = chat_response(user, text)
+            bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+            user.add_message(response, from_user=False)
         return
 
     # FSM — этап сбора формы (теперь автоматический)
@@ -497,6 +498,16 @@ def handle_all(message):
     # FSM — режим чата
     if user.interaction_state == "chat":
         logger.info(f"User entered message in chat mode: user_id={user.user_id}")
+        # Если пользователь в чате вдруг укажет цель похудеть, запускаем программу похудения
+        intent = detect_user_intent(text)
+        if intent == "коррекция веса":
+            user.generate_default_params()
+            user.interaction_state = 'collect_data'
+            logger.info(f"User switched to weight correction program: user_id={user.user_id}")
+            ask = ask_form_message(user)
+            bot.send_message(message.chat.id, ask, reply_markup=start_simulation_markup())
+            user.add_message(ask, from_user=False)
+            return
         response = chat_response(user, text)
         bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
         user.add_message(response, from_user=False)
