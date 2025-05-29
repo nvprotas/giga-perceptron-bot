@@ -383,9 +383,16 @@ def params_choice_markup():
     return markup
 
 def main_menu_markup():
+    # Оставляем для обратной совместимости, но не используем
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Следующий день", callback_data="next_sim_day"))
     return markup
+
+def main_menu_keyboard():
+    # Клавиатура с одной кнопкой "Следующий день"
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add(types.KeyboardButton("Следующий день"))
+    return keyboard
 
 # start_simulation_markup больше не нужен, так как кнопка не используется
 
@@ -438,6 +445,14 @@ def help_handler(message):
 
 @bot.message_handler(func=lambda m: True)
 def handle_all(message):
+    # Обработка нажатия на кнопку "Следующий день" с клавиатуры
+    if message.text.strip().lower() == "следующий день":
+        # Эмулируем callback для next_sim_day
+        fake_call = type('FakeCall', (), {})()
+        fake_call.message = message
+        fake_call.from_user = message.from_user
+        next_sim_day_callback(fake_call)
+        return
     user = get_user(message.from_user.id)
     text = message.text.strip()
     logger.info(f"Received message from user_id={user.user_id}: {text}")
@@ -478,7 +493,7 @@ def handle_all(message):
             # Общаемся с пользователем через LLM без стандартной отбивки
             user.interaction_state = "chat"
             response = chat_response(user, text)
-            bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+            bot.send_message(message.chat.id, response, reply_markup=main_menu_keyboard())
             user.add_message(response, from_user=False)
         return
 
@@ -528,7 +543,7 @@ def handle_all(message):
             bot.send_message(
                 message.chat.id,
                 f"{report}\n\n{bar}\n\n📝 Ваш индивидуальный план похудения:\n\n{plan_message}",
-                reply_markup=main_menu_markup()
+                reply_markup=main_menu_keyboard()
             )
             user.add_message(report, from_user=False)
             user.add_message(plan_message, from_user=False)
@@ -599,7 +614,7 @@ def handle_all(message):
             user.add_message(ask, from_user=False)
             return
         response = chat_response(user, text)
-        bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+        bot.send_message(message.chat.id, response, reply_markup=main_menu_keyboard())
         user.add_message(response, from_user=False)
         return
 
@@ -607,7 +622,7 @@ def handle_all(message):
     if user.interaction_state == "showing_history":
         logger.info(f"User interacted during showing_history: user_id={user.user_id}")
         response = chat_response(user, text)
-        bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+        bot.send_message(message.chat.id, response, reply_markup=main_menu_keyboard())
         user.add_message(response, from_user=False)
         return
 
@@ -615,7 +630,7 @@ def handle_all(message):
     if user.interaction_state == "daily_update":
         logger.info(f"User interacted during daily_update: user_id={user.user_id}")
         response = chat_response(user, text)
-        bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
+        bot.send_message(message.chat.id, response, reply_markup=main_menu_keyboard())
         user.add_message(response, from_user=False)
         return
 
@@ -715,27 +730,26 @@ def next_sim_day_callback(call):
     )
 
     # Показываем кнопки и обновляем состояние
-    markup = main_menu_markup()
     user.interaction_state = "daily_update"
     try:
-        bot.edit_message_text(
+        # Удаляем inline-кнопки, отправляем новый отчёт с клавиатурой
+        bot.send_message(
+            call.message.chat.id,
             report,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=markup,
+            reply_markup=main_menu_keyboard(),
             parse_mode='Markdown'
         )
     except Exception as e:
-        logger.error(f"Error editing message: {e}")
-        bot.send_message(call.message.chat.id, report, reply_markup=markup, parse_mode='Markdown')
+        logger.error(f"Error sending message: {e}")
+        bot.send_message(call.message.chat.id, report, reply_markup=main_menu_keyboard(), parse_mode='Markdown')
 
     # Конгратуляции, если порог превышен
     if user.total_score > 25:
-        bot.send_message(call.message.chat.id, "🎉 Поздравляем! Ваш общий счет превысил пороговое значение 25!")
+        bot.send_message(call.message.chat.id, "🎉 Поздравляем! Ваш общий счет превысил пороговое значение 25!", reply_markup=main_menu_keyboard())
 
     # Завершение симуляции через 14 дней
     if user.current_day >= 21:
-        bot.send_message(call.message.chat.id, "🎉 Вы прошли 21 день! Чтобы начать заново, отправьте /start")
+        bot.send_message(call.message.chat.id, "🎉 Вы прошли 21 день! Чтобы начать заново, отправьте /start", reply_markup=types.ReplyKeyboardRemove())
         user.reset_dialog()
 
 
