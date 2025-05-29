@@ -358,7 +358,6 @@ def params_choice_markup():
 def main_menu_markup():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Следующий день", callback_data="next_sim_day"))
-    markup.add(types.InlineKeyboardButton("💬 Чат с ботом", callback_data="start_chat"))
     return markup
 
 def start_simulation_markup():
