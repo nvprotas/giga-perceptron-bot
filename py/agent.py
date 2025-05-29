@@ -398,16 +398,14 @@ def params_choice_markup():
     return markup
 
 def main_menu_markup():
-    # Оставляем для обратной совместимости, но не используем
+    # Кнопка "Следующий день" будет показываться только после просмотра отчёта за день
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Следующий день", callback_data="next_sim_day"))
     return markup
 
 def main_menu_keyboard():
-    # Клавиатура с одной кнопкой "Следующий день"
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(types.KeyboardButton("Следующий день"))
-    return keyboard
+    # Клавиатура больше не используется
+    return None
 
 # start_simulation_markup больше не нужен, так как кнопка не используется
 
@@ -634,21 +632,93 @@ def handle_all(message):
         user.add_message(response, from_user=False)
         return
 
-    # FSM — показываем историю, ждем действия (кнопку)
+    # FSM — показываем историю, ждем действия пользователя (теперь текстом)
     if user.interaction_state == "showing_history":
         logger.info(f"User interacted during showing_history: user_id={user.user_id}")
-        response = chat_response(user, text)
-        bot.send_message(message.chat.id, response, reply_markup=main_menu_keyboard())
-        user.add_message(response, from_user=False)
+        # Проверяем, хочет ли пользователь посмотреть отчет за текущий день
+        report_prompt = (
+            "Пользователь пишет:\n"
+            f"'{text}'\n"
+            "Если пользователь хочет посмотреть отчет за текущий день, верни 'отчет'. "
+            "Если нет — верни 'нет'."
+        )
+        llm_response = call_llm([SystemMessage(report_prompt)])
+        logger.debug(f"LLM response for day report intent: {llm_response}")
+        if "отчет" in llm_response.lower():
+            # Показываем статистику и отчет за день, а затем кнопку "Следующий день"
+            day_dict = user.history_data[-1] if user.history_data else None
+            if day_dict:
+                day_text = day_report_message(user, day_dict)
+                bar = score_progress_bar(user.total_score)
+                report = (
+                    f"📅 <b>{day_dict['дата']}</b>\n"
+                    f"{humanify_params(day_dict)}\n"
+                    f"<b>Скор:</b> <code>{day_dict['скор']:.2f}</code>\n"
+                    f"<b>Сегодня:</b> <code>{day_dict['скор']:.2f}</code> баллов\n\n"
+                    f"{day_text}\n\n{bar}"
+                )
+                bot.send_message(
+                    message.chat.id,
+                    report,
+                    reply_markup=main_menu_markup(),
+                    parse_mode='HTML'
+                )
+                user.interaction_state = "wait_next_day"
+                return
+            else:
+                bot.send_message(message.chat.id, "Нет данных для отчёта за день.")
+                return
+        else:
+            response = chat_response(user, text)
+            bot.send_message(message.chat.id, response)
+            user.add_message(response, from_user=False)
+            return
+
+    # FSM — ожидание перехода к следующему дню (только кнопка)
+    if user.interaction_state == "wait_next_day":
+        # Ждём нажатия на кнопку "Следующий день"
         return
 
     # FSM — обработка новых дней после старта 7-дневки
     if user.interaction_state == "daily_update":
         logger.info(f"User interacted during daily_update: user_id={user.user_id}")
-        response = chat_response(user, text)
-        bot.send_message(message.chat.id, response, reply_markup=main_menu_keyboard())
-        user.add_message(response, from_user=False)
-        return
+        # Проверяем, хочет ли пользователь посмотреть отчет за текущий день
+        report_prompt = (
+            "Пользователь пишет:\n"
+            f"'{text}'\n"
+            "Если пользователь хочет посмотреть отчет за текущий день, верни 'отчет'. "
+            "Если нет — верни 'нет'."
+        )
+        llm_response = call_llm([SystemMessage(report_prompt)])
+        logger.debug(f"LLM response for day report intent: {llm_response}")
+        if "отчет" in llm_response.lower():
+            day_dict = user.history_data[-1] if user.history_data else None
+            if day_dict:
+                day_text = day_report_message(user, day_dict)
+                bar = score_progress_bar(user.total_score)
+                report = (
+                    f"📅 <b>{day_dict['дата']}</b>\n"
+                    f"{humanify_params(day_dict)}\n"
+                    f"<b>Скор:</b> <code>{day_dict['скор']:.2f}</code>\n"
+                    f"<b>Сегодня:</b> <code>{day_dict['скор']:.2f}</code> баллов\n\n"
+                    f"{day_text}\n\n{bar}"
+                )
+                bot.send_message(
+                    message.chat.id,
+                    report,
+                    reply_markup=main_menu_markup(),
+                    parse_mode='HTML'
+                )
+                user.interaction_state = "wait_next_day"
+                return
+            else:
+                bot.send_message(message.chat.id, "Нет данных для отчёта за день.")
+                return
+        else:
+            response = chat_response(user, text)
+            bot.send_message(message.chat.id, response)
+            user.add_message(response, from_user=False)
+            return
 
     # --- Если не FSM — запускать основного Health-LLM или отвечать дефолтом
     logger.info(f"No valid FSM state matched for user_id={user.user_id}. Sent default reply.")
@@ -736,38 +806,20 @@ def next_sim_day_callback(call):
     last_seven = user.history_data[-7:]
     user.total_score = sum(d['скор'] for d in last_seven)
 
-    # Шаг 3: отчёт по дню
-    day_text = day_report_message(user, day_dict)
-    bar = score_progress_bar(user.total_score)
-    report = (
-        f"📅 <b>{day_dict['дата']}</b>\n"
-        f"{humanify_params(day_dict)}\n"
-        f"<b>Скор:</b> <code>{day_dict['скор']:.2f}</code>\n"
-        f"<b>Сегодня:</b> <code>{day_dict['скор']:.2f}</code> баллов\n\n"
-        f"{day_text}\n\n{bar}"
-    )
-
-    # Показываем кнопки и обновляем состояние
+    # После генерации дня переводим в состояние ожидания текстового запроса на отчет
     user.interaction_state = "daily_update"
-    try:
-        # Удаляем inline-кнопки, отправляем новый отчёт с клавиатурой
-        bot.send_message(
-            call.message.chat.id,
-            report,
-            reply_markup=main_menu_keyboard(),
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        bot.send_message(call.message.chat.id, report, reply_markup=main_menu_keyboard(), parse_mode='HTML')
+    bot.send_message(
+        call.message.chat.id,
+        "День завершён! Напишите, если хотите посмотреть отчёт за текущий день.",
+    )
 
     # Конгратуляции, если порог превышен
     if user.total_score > 25:
-        bot.send_message(call.message.chat.id, "🎉 Поздравляем! Ваш общий счет превысил пороговое значение 25!", reply_markup=main_menu_keyboard())
+        bot.send_message(call.message.chat.id, "🎉 Поздравляем! Ваш общий счет превысил пороговое значение 25!")
 
     # Завершение симуляции через 14 дней
     if user.current_day >= 21:
-        bot.send_message(call.message.chat.id, "🎉 Вы прошли 21 день! Чтобы начать заново, отправьте /start", reply_markup=types.ReplyKeyboardRemove())
+        bot.send_message(call.message.chat.id, "🎉 Вы прошли 21 день! Чтобы начать заново, отправьте /start")
         user.reset_dialog()
 
 
