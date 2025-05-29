@@ -21,7 +21,7 @@ MODEL_PROVIDER = os.getenv("MODEL_PROVIDER")
 MODEL = os.getenv("MODEL")
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
