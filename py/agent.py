@@ -508,21 +508,23 @@ def handle_all(message):
             # Генерируем параметры автоматически
             user.generate_default_params()
             # Определяем пол по имени пользователя с помощью LLM
-            if user.user_name:
-                name = user.user_name.strip()
-                gender_prompt = (
-                    f"Определи пол по имени: '{name}'. "
-                    "Ответь только одним словом: 'мужчина' или 'женщина'."
-                )
-                gender_response = call_llm([SystemMessage(gender_prompt)])
-                gender = gender_response.lower().strip()
-                if "жен" in gender:
-                    user.input_answers["пол"] = "женщина"
-                elif "муж" in gender:
-                    user.input_answers["пол"] = "мужчина"
-                else:
-                    user.input_answers["пол"] = gender  # fallback, если LLM вернул что-то другое
-                logger.info(f"Определён пол по имени '{name}': {user.input_answers['пол']}")
+            # if user.user_name:
+            #     name = user.user_name.strip()
+            user.input_answers["пол"] = "мужчина"
+
+                # gender_prompt = (
+                #     f"Определи пол по имени: '{name}'. "
+                #     "Ответь только одним словом: 'мужчина' или 'женщина'."
+                # )
+                # gender_response = call_llm([SystemMessage(gender_prompt)])
+                # gender = gender_response.lower().strip()
+                # if "жен" in gender:
+                #     user.input_answers["пол"] = "женщина"
+                # elif "муж" in gender:
+                #     user.input_answers["пол"] = "мужчина"
+                # else:
+                #     user.input_answers["пол"] = gender  # fallback, если LLM вернул что-то другое
+                # logger.info(f"Определён пол по имени '{name}': {user.input_answers['пол']}")
             user.interaction_state = 'collect_data'
             logger.info(f"State updated: user_id={user.user_id}, interaction_state='collect_data'")
             ask = ask_form_message(user)
