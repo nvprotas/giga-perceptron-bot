@@ -339,7 +339,7 @@ def format_user_params(user_info: dict) -> str:
         f"• Спорт: {user_info.get('спорт', 'не указано')}\n"
         f"• Чтение: {user_info.get('чтение', 'не указано')}\n"
         f"• Медитация: {user_info.get('медитация', 'не указано')}\n"
-        f"• Шаги: {user_info.get('шаги', 'не указано')}"
+        # f"• Шаги: {user_info.get('шаги', 'не указано')}"
     )
 
 # FSM Dictionary (by user_id) - ключ состояния в анкете
