@@ -550,7 +550,7 @@ def handle_all(message):
             user.interaction_state = 'collect_data'
             logger.info(f"User switched to weight correction program: user_id={user.user_id}")
             ask = ask_form_message(user)
-            bot.send_message(message.chat.id, ask, reply_markup=start_simulation_markup())
+            bot.send_message(message.chat.id, ask)
             user.add_message(ask, from_user=False)
             return
         response = chat_response(user, text)
