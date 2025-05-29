@@ -507,7 +507,7 @@ def handle_all(message):
 def start_simulation_callback(call):
     user = get_user(call.from_user.id)
     logger.info(f"User {user.user_id} starts simulation (callback start_simulation)")
-    bot.edit_message_text("🔄 Генерирую вашу историю за 7 дней...",
+    bot.edit_message_text("📂 Загружаю историю за последние 7 дней...",
                          chat_id=call.message.chat.id,
                          message_id=call.message.message_id)
 
@@ -531,7 +531,7 @@ def start_simulation_callback(call):
 def generate_params_callback(call):
     user = get_user(call.from_user.id)
     logger.info(f"User {user.user_id} requested generate_params callback")
-    bot.edit_message_text("🔄 Генерирую вашу историю за 7 дней...",
+    bot.edit_message_text("📂 Загружаю историю за последние 7 дней...",
                          chat_id=call.message.chat.id,
                          message_id=call.message.message_id)
 
