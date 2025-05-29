@@ -446,8 +446,7 @@ def handle_all(message):
             user.interaction_state = 'collect_data'
             logger.info(f"State updated: user_id={user.user_id}, interaction_state='collect_data'")
             ask = ask_form_message(user)
-            # Убираем кнопку "загрузить исторические данные", ждем ответ пользователя на естественном языке
-            bot.send_message(message.chat.id, ask)
+            bot.send_message(message.chat.id, ask, reply_markup=start_simulation_markup())
             user.add_message(ask, from_user=False)
         else:
             # Общаемся с пользователем через LLM без стандартной отбивки
@@ -456,55 +455,6 @@ def handle_all(message):
             bot.send_message(message.chat.id, response, reply_markup=main_menu_markup())
             user.add_message(response, from_user=False)
         return
-```
-
-py/agent.py
-```python
-<<<<<<< SEARCH
-@bot.callback_query_handler(func=lambda call: call.data == "start_simulation")
-def start_simulation_callback(call):
-    user = get_user(call.from_user.id)
-    logger.info(f"User {user.user_id} starts simulation (callback start_simulation)")
-    bot.edit_message_text("📂 Загружаю историю за последние 7 дней...",
-                         chat_id=call.message.chat.id,
-                         message_id=call.message.message_id)
-
-    # Генерация истории 7 дней
-    form_info = user.input_answers.copy()
-    hist = make_7days_history(form_info)
-    user.history_data = hist
-    user.total_score = float(sum(d['скор'] for d in hist))
-    user.current_day = 7
-    user.interaction_state = "showing_history"
-    logger.info(f"History generated and state updated for user_id={user.user_id}")
-    report = report_history_message(user)
-    bar = score_progress_bar(user.total_score)
-    # Генерация индивидуального плана похудения на основе истории
-    plan_prompt = (
-        "На основе следующих параметров пользователя и его истории за 7 дней создай индивидуальную программу коррекции веса. "
-        "Учитывай динамику и особенности истории. "
-        "Опиши рекомендации по питанию, физической активности и режиму сна, чтобы помочь достичь цели. "
-        "Сделай текст мотивирующим и поддерживающим. "
-        "Длина плана должна быть от 1000 до 2000 символов. Не превышай этот лимит. "
-        "История пользователя:\n"
-    )
-    # Формируем текст истории для передачи в LLM
-    history_text = "\n".join([
-        f"{d['дата']}: {humanify_params(d)} (скор: {d['скор']})" for d in hist
-    ])
-    params_text = format_user_params(user.input_answers)
-    plan_message = call_llm([
-        SystemMessage(plan_prompt),
-        HumanMessage(f"{params_text}\n\n{history_text}")
-    ])
-    bot.edit_message_text(
-        f"{report}\n\n{bar}\n\n📝 Ваш индивидуальный план похудения:\n\n{plan_message}",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=main_menu_markup()
-    )
-    user.add_message(report, from_user=False)
-    user.add_message(plan_message, from_user=False)
 
     # FSM — этап сбора формы (теперь автоматический)
     if user.interaction_state == "collect_data":
