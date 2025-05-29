@@ -459,9 +459,19 @@ def handle_all(message):
     # FSM — этап подтверждения корректности параметров и генерации истории
     if user.interaction_state == "collect_data":
         logger.info(f"Collecting data from user_id={user.user_id} during 'collect_data' FSM stage")
-        # Проверяем, подтвердил ли пользователь корректность параметров
-        ok_words = ["всё ок", "все ок", "да", "ок", "все хорошо", "всё хорошо", "верно", "правильно"]
-        if any(word in text.lower() for word in ok_words):
+        # Анализируем ответ пользователя с помощью LLM: подтверждает ли он корректность параметров?
+        params_text = format_user_params(user.input_answers)
+        prompt = (
+            "Вот текущие параметры пользователя:\n"
+            f"{params_text}\n"
+            f"Пользователь написал: {text}\n"
+            "Если пользователь подтвердил, что параметры корректны, верни 'подтверждено'. "
+            "Если пользователь указал, что нужно что-то изменить, верни только изменённые параметры в формате ключ=значение, через запятую. "
+            "Если изменений нет, верни 'нет изменений'."
+        )
+        llm_response = call_llm([SystemMessage(prompt)])
+        logger.info(f"LLM param/confirmation response: {llm_response}")
+        if "подтверждено" in llm_response.lower():
             # Генерируем историю 7 дней
             form_info = user.input_answers.copy()
             hist = make_7days_history(form_info)
@@ -474,39 +484,26 @@ def handle_all(message):
             bar = score_progress_bar(user.total_score)
             bot.send_message(message.chat.id, f"{report}\n\n{bar}", reply_markup=main_menu_markup())
             user.add_message(report, from_user=False)
+        elif "нет изменений" in llm_response.lower():
+            # Если LLM считает, что изменений нет, повторно просим подтвердить
+            bot.send_message(message.chat.id, "Если всё верно, подтвердите это, либо напишите, что нужно изменить.")
         else:
-            # Попробуем проанализировать ответ пользователя с помощью LLM и обновить параметры, если нужно
-            # Промпт для LLM: "Вот текущие параметры ... Пользователь написал: ... Какие параметры нужно изменить? Верни только изменённые значения в формате ключ=значение, через запятую."
-            params_text = format_user_params(user.input_answers)
-            prompt = (
-                "Вот текущие параметры пользователя:\n"
-                f"{params_text}\n"
-                f"Пользователь написал: {text}\n"
-                "Если пользователь указал, что нужно что-то изменить, верни только изменённые параметры в формате ключ=значение, через запятую. "
-                "Если изменений нет, верни 'нет изменений'."
-            )
-            llm_response = call_llm([SystemMessage(prompt)])
-            logger.info(f"LLM param correction response: {llm_response}")
-            if "нет изменений" in llm_response.lower():
-                # Если LLM считает, что изменений нет, повторно просим подтвердить
-                bot.send_message(message.chat.id, "Если всё верно, напишите 'всё ок' или 'да'. Если нужно что-то изменить, напишите, что именно.")
-            else:
-                # Парсим ответ LLM и обновляем параметры
-                try:
-                    pairs = llm_response.split(',')
-                    for pair in pairs:
-                        if '=' in pair:
-                            key, value = pair.split('=', 1)
-                            user.input_answers[key.strip()] = value.strip()
-                    # Показываем обновлённые параметры и снова просим подтвердить
-                    params_text = format_user_params(user.input_answers)
-                    bot.send_message(
-                        message.chat.id,
-                        f"Обновлённые параметры:\n{params_text}\n\nЕсли всё верно, напишите 'всё ок' или 'да'."
-                    )
-                except Exception as e:
-                    logger.error(f"Error parsing LLM param correction: {e}")
-                    bot.send_message(message.chat.id, "Не удалось распознать изменения. Пожалуйста, напишите, что нужно изменить, или подтвердите корректность параметров.")
+            # Парсим ответ LLM и обновляем параметры
+            try:
+                pairs = llm_response.split(',')
+                for pair in pairs:
+                    if '=' in pair:
+                        key, value = pair.split('=', 1)
+                        user.input_answers[key.strip()] = value.strip()
+                # Показываем обновлённые параметры и снова просим подтвердить
+                params_text = format_user_params(user.input_answers)
+                bot.send_message(
+                    message.chat.id,
+                    f"Обновлённые параметры:\n{params_text}\n\nЕсли всё верно, подтвердите это, либо напишите, что нужно изменить."
+                )
+            except Exception as e:
+                logger.error(f"Error parsing LLM param correction: {e}")
+                bot.send_message(message.chat.id, "Не удалось распознать изменения. Пожалуйста, напишите, что нужно изменить, или подтвердите корректность параметров.")
         return
 
     # FSM — ввод параметров пользователем
