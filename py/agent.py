@@ -520,12 +520,6 @@ def start_simulation_callback(call):
     logger.info(f"History generated and state updated for user_id={user.user_id}")
     report = report_history_message(user)
     bar = score_progress_bar(user.total_score)
-    bot.edit_message_text(f"{report}\n\n{bar}",
-                         chat_id=call.message.chat.id,
-                         message_id=call.message.message_id,
-                         reply_markup=main_menu_markup())
-    user.add_message(report, from_user=False)
-
     # Генерация индивидуального плана похудения на основе истории
     plan_prompt = (
         "На основе следующих параметров пользователя и его истории за 7 дней создай индивидуальную программу коррекции веса. "
@@ -543,7 +537,13 @@ def start_simulation_callback(call):
         SystemMessage(plan_prompt),
         HumanMessage(f"{params_text}\n\n{history_text}")
     ])
-    bot.send_message(call.message.chat.id, f"📝 Ваш индивидуальный план похудения:\n\n{plan_message}")
+    bot.edit_message_text(
+        f"{report}\n\n{bar}\n\n📝 Ваш индивидуальный план похудения:\n\n{plan_message}",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=main_menu_markup()
+    )
+    user.add_message(report, from_user=False)
     user.add_message(plan_message, from_user=False)
 
 @bot.callback_query_handler(func=lambda call: call.data == "generate_params")
