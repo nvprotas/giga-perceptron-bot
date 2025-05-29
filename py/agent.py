@@ -482,8 +482,30 @@ def handle_all(message):
             logger.info(f"History for confirmed params generated for user_id={user.user_id}")
             report = report_history_message(user)
             bar = score_progress_bar(user.total_score)
-            bot.send_message(message.chat.id, f"{report}\n\n{bar}", reply_markup=main_menu_markup())
+            # Генерация индивидуального плана похудения на основе истории
+            plan_prompt = (
+                "На основе следующих параметров пользователя и его истории за 7 дней создай индивидуальную программу коррекции веса. "
+                "Учитывай динамику и особенности истории. "
+                "Опиши рекомендации по питанию, физической активности и режиму сна, чтобы помочь достичь цели. "
+                "Сделай текст мотивирующим и поддерживающим. "
+                "Длина плана должна быть от 1000 до 2000 символов. Не превышай этот лимит. "
+                "История пользователя:\n"
+            )
+            history_text = "\n".join([
+                f"{d['дата']}: {humanify_params(d)} (скор: {d['скор']})" for d in hist
+            ])
+            params_text = format_user_params(user.input_answers)
+            plan_message = call_llm([
+                SystemMessage(plan_prompt),
+                HumanMessage(f"{params_text}\n\n{history_text}")
+            ])
+            bot.send_message(
+                message.chat.id,
+                f"{report}\n\n{bar}\n\n📝 Ваш индивидуальный план похудения:\n\n{plan_message}",
+                reply_markup=main_menu_markup()
+            )
             user.add_message(report, from_user=False)
+            user.add_message(plan_message, from_user=False)
         elif "нет изменений" in llm_response.lower():
             # Если LLM считает, что изменений нет, повторно просим подтвердить
             bot.send_message(message.chat.id, "Если всё верно, подтвердите это, либо напишите, что нужно изменить.")
