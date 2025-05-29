@@ -360,7 +360,7 @@ def main_menu_markup():
 
 def start_simulation_markup():
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🚀 Начать симуляцию", callback_data="start_simulation"))
+    markup.add(types.InlineKeyboardButton("📂 Загрузить исторические данные", callback_data="start_simulation"))
     return markup
 
 def detect_user_intent(user_goal: str) -> str:
