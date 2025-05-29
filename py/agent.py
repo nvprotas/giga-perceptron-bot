@@ -526,6 +526,26 @@ def start_simulation_callback(call):
                          reply_markup=main_menu_markup())
     user.add_message(report, from_user=False)
 
+    # Генерация индивидуального плана похудения на основе истории
+    plan_prompt = (
+        "На основе следующих параметров пользователя и его истории за 7 дней создай индивидуальную программу коррекции веса. "
+        "Учитывай динамику и особенности истории. "
+        "Опиши рекомендации по питанию, физической активности и режиму сна, чтобы помочь достичь цели. "
+        "Сделай текст мотивирующим и поддерживающим. "
+        "История пользователя:\n"
+    )
+    # Формируем текст истории для передачи в LLM
+    history_text = "\n".join([
+        f"{d['дата']}: {humanify_params(d)} (скор: {d['скор']})" for d in hist
+    ])
+    params_text = format_user_params(user.input_answers)
+    plan_message = call_llm([
+        SystemMessage(plan_prompt),
+        HumanMessage(f"{params_text}\n\n{history_text}")
+    ])
+    bot.send_message(call.message.chat.id, f"📝 Ваш индивидуальный план похудения:\n\n{plan_message}")
+    user.add_message(plan_message, from_user=False)
+
 @bot.callback_query_handler(func=lambda call: call.data == "generate_params")
 def generate_params_callback(call):
     user = get_user(call.from_user.id)
